@@ -1,0 +1,688 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row mb-4">
+    <div class="col-md-12">
+        <h2>Sports Predictions</h2>
+        <div class="d-flex align-items-center gap-3">
+            <select class="form-select" id="sportSelector" style="max-width: 200px;">
+                <option value="NBA">NBA Basketball</option>
+                <option value="MLB">MLB Baseball</option>
+                <option value="NFL">NFL Football</option>
+            </select>
+            <button class="btn btn-outline-primary" id="refreshButton">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </div>
+    </div>
+</div>
+
+<div id="gamesList">
+    <div class="text-center">
+        <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading games...</span>
+        </div>
+    </div>
+</div>
+
+<!-- Modal for predictions -->
+<div class="modal fade" id="predictionModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Game Prediction</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="loadingIndicator" class="d-none">
+                    <div class="d-flex justify-content-center my-4">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">Loading prediction...</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="predictionResults" class="d-none">
+                    <div class="alert alert-primary">
+                        <h4 id="winner" class="alert-heading"></h4>
+                        <p id="score" class="mb-0"></p>
+                        <p class="mb-0">Confidence: <span id="confidence"></span></p>
+                        <p id="spread" class="mb-0"></p>
+                    </div>
+
+                    <!-- Add betting tracking section -->
+                    <div class="card mb-4">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <h5 class="card-title mb-0">Track Bet</h5>
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="trackBetSwitch">
+                                <label class="form-check-label" for="trackBetSwitch">Enable Bet Tracking</label>
+                            </div>
+                        </div>
+                        <div id="betForm" class="card-body d-none">
+                            <!-- Bet Type Selection -->
+                            <div class="mb-3">
+                                <label class="form-label">Select Bet Type</label>
+                                <div class="btn-group w-100" role="group">
+                                    <input type="radio" class="btn-check" name="betType" id="pointSpreadBet" value="spread">
+                                    <label class="btn btn-outline-primary" for="pointSpreadBet">Point Spread</label>
+
+                                    <input type="radio" class="btn-check" name="betType" id="moneyLineBet" value="moneyline">
+                                    <label class="btn btn-outline-primary" for="moneyLineBet">Money Line</label>
+
+                                    <input type="radio" class="btn-check" name="betType" id="parlayBet" value="parlay">
+                                    <label class="btn btn-outline-primary" for="parlayBet">Parlay</label>
+                                </div>
+                            </div>
+
+                            <!-- Point Spread Options -->
+                            <div id="spreadOptions" class="d-none">
+                                <div class="mb-3">
+                                    <label class="form-label">Select Team</label>
+                                    <div class="btn-group w-100" role="group" id="spreadTeamSelection">
+                                        <!-- Teams will be populated dynamically -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Money Line Options -->
+                            <div id="moneyLineOptions" class="d-none">
+                                <div class="mb-3">
+                                    <label class="form-label">Select Team</label>
+                                    <div class="btn-group w-100" role="group" id="moneyLineTeamSelection">
+                                        <!-- Teams will be populated dynamically -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Parlay Options -->
+                            <div id="parlayOptions" class="d-none">
+                                <div class="mb-3">
+                                    <label class="form-label">Select Additional Games</label>
+                                    <div id="parlayGamesList" class="list-group">
+                                        <!-- Other games will be populated dynamically -->
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Bet Amount -->
+                            <div class="mb-3">
+                                <label for="betAmount" class="form-label">Bet Amount ($)</label>
+                                <input type="number" class="form-control" id="betAmount" min="1" step="1">
+                            </div>
+
+                            <!-- Potential Payout -->
+                            <div class="alert alert-info" id="potentialPayout">
+                                Potential Payout: $0.00
+                            </div>
+
+                            <button class="btn btn-primary w-100" id="placeBetBtn">Place Bet</button>
+                        </div>
+                    </div>
+
+                    <div class="card mb-4">
+                        <div class="card-header">
+                            <h5 class="card-title mb-0">Betting Odds</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="row">
+                                <div class="col-md-4">
+                                    <h6 class="text-muted">Spread</h6>
+                                    <p id="spreadOdds" class="h4 mb-0"></p>
+                                </div>
+                                <div class="col-md-4">
+                                    <h6 class="text-muted">Over/Under</h6>
+                                    <p id="overUnder" class="h4 mb-0"></p>
+                                </div>
+                                <div class="col-md-4">
+                                    <h6 class="text-muted">Money Line</h6>
+                                    <p id="moneyLine" class="h4 mb-0"></p>
+                                </div>
+                            </div>
+                            <small id="oddsInfo" class="text-muted d-block text-center mt-3"></small>
+                        </div>
+                    </div>
+
+                    <div class="card mb-4">
+                        <div class="card-header">
+                            <h5 class="card-title mb-0">Analysis</h5>
+                        </div>
+                        <div class="card-body">
+                            <ul id="analysis" class="list-group list-group-flush"></ul>
+                        </div>
+                    </div>
+
+                    <canvas id="probabilityChart"></canvas>
+                </div>
+
+                <div id="errorDisplay" class="d-none">
+                    <div class="alert alert-danger">
+                        <i class="fas fa-exclamation-circle me-2"></i>
+                        <span id="errorMessage"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Initialize global variables
+let gamesData = {};
+let predictionModal = null;
+let chart = null;
+let currentSport = 'NBA';
+
+// Debug logging function
+function debug(message, data) {
+    console.log(`[DEBUG] ${message}`, data || '');
+}
+
+// Initialize window.currentPredictions if not exists
+if (!window.currentPredictions) {
+    window.currentPredictions = [];
+}
+
+// Initialize on document load
+document.addEventListener('DOMContentLoaded', () => {
+    debug('Initializing...');
+    predictionModal = new bootstrap.Modal(document.getElementById('predictionModal'));
+
+    document.getElementById('sportSelector').addEventListener('change', loadGames);
+    document.getElementById('refreshButton').addEventListener('click', loadGames);
+
+    loadGames();
+});
+
+// Load games
+async function loadGames() {
+    debug('Loading games...');
+    const gamesList = document.getElementById('gamesList');
+
+    try {
+        currentSport = document.getElementById('sportSelector').value;
+        const response = await fetch(`/api/games/upcoming?sport=${currentSport}`);
+        if (!response.ok) throw new Error('Failed to fetch games');
+
+        const games = await response.json();
+        debug('Received games:', games);
+
+        // Store games data for later use
+        gamesData = {};
+        games.forEach(game => {
+            gamesData[game.id] = game;
+            debug('Game date:', game.date);
+        });
+
+        // Group games by date and sort chronologically
+        const groupedGames = groupGamesByDate(games);
+        const sortedDates = Object.keys(groupedGames).sort();
+
+        // Generate HTML
+        gamesList.innerHTML = sortedDates.length ?
+            sortedDates.map(date => generateDateSection(date, groupedGames[date])).join('') :
+            '<div class="alert alert-info">No upcoming games available.</div>';
+
+    } catch (error) {
+        console.error('Error loading games:', error);
+        gamesList.innerHTML = `
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-circle me-2"></i>
+                Error loading games: ${error.message}
+            </div>
+        `;
+    }
+}
+
+// Format date for display
+function formatDate(dateStr) {
+    try {
+        debug('Formatting date:', dateStr);
+        const [year, month, day] = dateStr.split('-').map(Number);
+        const date = new Date(Date.UTC(year, month - 1, day));
+
+        return new Intl.DateTimeFormat('en-US', {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            timeZone: 'UTC'
+        }).format(date);
+    } catch (error) {
+        console.error('Error formatting date:', error);
+        return dateStr;
+    }
+}
+
+// Group games by date
+function groupGamesByDate(games) {
+    return games.reduce((acc, game) => {
+        if (!acc[game.date]) acc[game.date] = [];
+        acc[game.date].push(game);
+        return acc;
+    }, {});
+}
+
+// Generate HTML for date section
+function generateDateSection(date, games) {
+    return `
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="mb-0">${formatDate(date)}</h5>
+            </div>
+            <div class="card-body">
+                ${games.map(game => `
+                    <div class="row align-items-center mb-3">
+                        <div class="col-md-4">
+                            <h5 class="mb-1">${game.home_team.name}</h5>
+                            <small class="text-muted">
+                                Win %: ${(game.home_team.win_pct * 100).toFixed(1)}% | 
+                                Avg: ${game.home_team.points_avg.toFixed(1)} pts
+                            </small>
+                        </div>
+                        <div class="col-md-2 text-center">
+                            <h5>VS</h5>
+                            <p class="mb-0">${game.time}</p>
+                        </div>
+                        <div class="col-md-4">
+                            <h5 class="mb-1">${game.away_team.name}</h5>
+                            <small class="text-muted">
+                                Win %: ${(game.away_team.win_pct * 100).toFixed(1)}% | 
+                                Avg: ${game.away_team.points_avg.toFixed(1)} pts
+                            </small>
+                        </div>
+                        <div class="col-md-2 text-center">
+                            <button type="button" class="btn btn-primary" onclick="makePrediction('${game.id}')">
+                                Predict
+                            </button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    `;
+}
+
+// Make prediction for a game
+async function makePrediction(gameId) {
+    debug('Making prediction for game:', gameId);
+
+    const game = gamesData[gameId];
+    if (!game) {
+        console.error('Game not found:', gameId);
+        return;
+    }
+
+    const loadingIndicator = document.getElementById('loadingIndicator');
+    const predictionResults = document.getElementById('predictionResults');
+    const errorDisplay = document.getElementById('errorDisplay');
+
+    try {
+        // Show loading state
+        loadingIndicator.classList.remove('d-none');
+        predictionResults.classList.add('d-none');
+        errorDisplay.classList.add('d-none');
+        predictionModal.show();
+
+        // Make prediction request
+        const response = await fetch(`/api/predict/${currentSport.toLowerCase()}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(game)
+        });
+
+        const result = await response.json();
+        debug('Prediction result:', result);
+
+        if (!response.ok) {
+            throw new Error(result.error || 'Failed to get prediction');
+        }
+
+        // Store prediction for AI analysis
+        if (!window.currentPredictions) {
+            window.currentPredictions = [];
+        }
+
+        // Add prediction with timestamp
+        window.currentPredictions.push({
+            gameId,
+            game,
+            prediction: result,
+            timestamp: new Date().toISOString()
+        });
+
+        debug('Updated predictions array:', window.currentPredictions);
+
+        // Update prediction display
+        loadingIndicator.classList.add('d-none');
+        predictionResults.classList.remove('d-none');
+        updatePredictionDisplay(game, result);
+
+    } catch (error) {
+        console.error('Error making prediction:', error);
+        loadingIndicator.classList.add('d-none');
+        predictionResults.classList.add('d-none');
+        errorDisplay.classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = error.message;
+    }
+}
+
+// Update prediction display
+function updatePredictionDisplay(game, result) {
+    try {
+        const homeWinProb = result.home_team_win_probability * 100;
+        const awayWinProb = result.away_team_win_probability * 100;
+        const winner = homeWinProb > awayWinProb ? game.home_team.name : game.away_team.name;
+        const winProb = Math.max(homeWinProb, awayWinProb);
+
+        document.getElementById('winner').textContent =
+            `Predicted Winner: ${winner} (${winProb.toFixed(1)}% chance)`;
+
+        document.getElementById('score').textContent =
+            `Predicted Score: ${game.home_team.name} ${result.predicted_scores.home} - ${result.predicted_scores.away} ${game.away_team.name}`;
+
+        document.getElementById('confidence').textContent =
+            `${(result.confidence_score * 100).toFixed(1)}%`;
+
+        const favoredTeam = result.point_spread > 0 ? game.home_team.name : game.away_team.name;
+        document.getElementById('spread').textContent =
+            `Point Spread: ${favoredTeam} favored by ${Math.abs(result.point_spread).toFixed(1)} points`;
+
+        // Update odds display
+        if (result.odds) {
+            document.getElementById('spreadOdds').textContent = result.odds.spread || 'N/A';
+            document.getElementById('overUnder').textContent =
+                result.odds.over_under ? `O/U ${result.odds.over_under}` : 'N/A';
+
+            const formatOdds = ml => ml > 0 ? `+${ml}` : ml.toString();
+            const moneyLine = result.odds.money_line;
+            document.getElementById('moneyLine').textContent = moneyLine ?
+                `${formatOdds(moneyLine.home)} / ${formatOdds(moneyLine.away)}` : 'N/A';
+
+            document.getElementById('oddsInfo').textContent =
+                `Odds provided by ${result.odds.provider} - Last updated: ${new Date(result.odds.updated).toLocaleString()}`;
+        }
+
+        // Update analysis section
+        if (result.spread_analysis?.reason) {
+            document.getElementById('analysis').innerHTML =
+                result.spread_analysis.reason
+                    .map(reason => `<li class="list-group-item">${reason}</li>`)
+                    .join('');
+        }
+
+        // Update probability chart
+        updateChart(game, result);
+
+    } catch (error) {
+        console.error('Error updating prediction display:', error);
+        throw error;
+    }
+}
+
+// Update probability chart
+function updateChart(game, result) {
+    try {
+        const ctx = document.getElementById('probabilityChart').getContext('2d');
+
+        if (chart) {
+            chart.destroy();
+        }
+
+        chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: [game.home_team.name, game.away_team.name],
+                datasets: [{
+                    label: 'Win Probability',
+                    data: [
+                        result.home_team_win_probability,
+                        result.away_team_win_probability
+                    ],
+                    backgroundColor: [
+                        'rgba(75, 192, 192, 0.2)',
+                        'rgba(255, 99, 132, 0.2)'
+                    ],
+                    borderColor: [
+                        'rgba(75, 192, 192, 1)',
+                        'rgba(255, 99, 132, 1)'
+                    ],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 1,
+                        ticks: {
+                            callback: value => `${(value * 100)}%`
+                        }
+                    }
+                },
+                plugins: {
+                    tooltip: {
+                        callbacks: {
+                            label: context =>
+                                `Win Probability: ${(context.raw * 100).toFixed(1)}%`
+                        }
+                    }
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Error updating chart:', error);
+    }
+}
+
+function initializeBettingForm(game, prediction) {
+    const trackBetSwitch = document.getElementById('trackBetSwitch');
+    const betForm = document.getElementById('betForm');
+    const spreadOptions = document.getElementById('spreadOptions');
+    const moneyLineOptions = document.getElementById('moneyLineOptions');
+    const parlayOptions = document.getElementById('parlayOptions');
+    const betAmount = document.getElementById('betAmount');
+    const potentialPayout = document.getElementById('potentialPayout');
+    const placeBetBtn = document.getElementById('placeBetBtn');
+
+    // Toggle bet form visibility
+    trackBetSwitch.addEventListener('change', function() {
+        betForm.classList.toggle('d-none', !this.checked);
+        if (this.checked) {
+            populateTeamSelections(game);
+            loadOtherGamesForParlay(game);
+        }
+    });
+
+    // Handle bet type selection
+    document.querySelectorAll('input[name="betType"]').forEach(radio => {
+        radio.addEventListener('change', function() {
+            spreadOptions.classList.add('d-none');
+            moneyLineOptions.classList.add('d-none');
+            parlayOptions.classList.add('d-none');
+
+            switch(this.value) {
+                case 'spread':
+                    spreadOptions.classList.remove('d-none');
+                    break;
+                case 'moneyline':
+                    moneyLineOptions.classList.remove('d-none');
+                    break;
+                case 'parlay':
+                    parlayOptions.classList.remove('d-none');
+                    break;
+            }
+            updatePotentialPayout();
+        });
+    });
+
+    // Populate team selections
+    function populateTeamSelections(game) {
+        const spreadTeams = document.getElementById('spreadTeamSelection');
+        const moneyLineTeams = document.getElementById('moneyLineTeamSelection');
+
+        const teamsHtml = `
+            <input type="radio" class="btn-check" name="spreadTeam" id="spread${game.home_team.name}" value="${game.home_team.name}">
+            <label class="btn btn-outline-primary" for="spread${game.home_team.name}">${game.home_team.name}</label>
+            <input type="radio" class="btn-check" name="spreadTeam" id="spread${game.away_team.name}" value="${game.away_team.name}">
+            <label class="btn btn-outline-primary" for="spread${game.away_team.name}">${game.away_team.name}</label>
+        `;
+
+        const moneyLineHtml = `
+            <input type="radio" class="btn-check" name="moneyLineTeam" id="ml${game.home_team.name}" value="${game.home_team.name}">
+            <label class="btn btn-outline-primary" for="ml${game.home_team.name}">${game.home_team.name}</label>
+            <input type="radio" class="btn-check" name="moneyLineTeam" id="ml${game.away_team.name}" value="${game.away_team.name}">
+            <label class="btn btn-outline-primary" for="ml${game.away_team.name}">${game.away_team.name}</label>
+        `;
+
+        spreadTeams.innerHTML = teamsHtml;
+        moneyLineTeams.innerHTML = moneyLineHtml;
+    }
+
+    // Load other games for parlay
+    async function loadOtherGamesForParlay(currentGame) {
+        try {
+            const response = await fetch(`/api/games/upcoming?sport=${currentSport}`);
+            if (!response.ok) throw new Error('Failed to fetch games');
+
+            const games = await response.json();
+            const parlayGamesList = document.getElementById('parlayGamesList');
+            parlayGamesList.innerHTML = games
+                .filter(g => g.id !== currentGame.id)
+                .map(game => `
+                    <div class="list-group-item">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <h6 class="mb-1">${game.home_team.name} vs ${game.away_team.name}</h6>
+                                <small class="text-muted">${game.time}</small>
+                            </div>
+                            <div class="btn-group" role="group">
+                                <input type="radio" class="btn-check" name="parlay${game.id}" id="parlay${game.id}Home" value="${game.home_team.name}">
+                                <label class="btn btn-outline-primary btn-sm" for="parlay${game.id}Home">${game.home_team.name}</label>
+                                <input type="radio" class="btn-check" name="parlay${game.id}" id="parlay${game.id}Away" value="${game.away_team.name}">
+                                <label class="btn btn-outline-primary btn-sm" for="parlay${game.id}Away">${game.away_team.name}</label>
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+
+            // Add change listeners for parlay selections
+            parlayGamesList.querySelectorAll('input[type="radio"]').forEach(radio => {
+                radio.addEventListener('change', updatePotentialPayout);
+            });
+        } catch (error) {
+            console.error('Error loading games for parlay:', error);
+        }
+    }
+
+    // Calculate potential payout based on selection
+    function updatePotentialPayout() {
+        const amount = parseFloat(betAmount.value) || 0;
+        let multiplier = 1;
+
+        const betType = document.querySelector('input[name="betType"]:checked')?.value;
+        if (!betType) return;
+
+        switch(betType) {
+            case 'spread':
+                multiplier = 1.91; // Standard -110 odds
+                break;
+            case 'moneyline':
+                const selectedTeam = document.querySelector('input[name="moneyLineTeam"]:checked')?.value;
+                if (selectedTeam === game.home_team.name) {
+                    multiplier = prediction.odds.money_line.home > 0 ? 
+                        (prediction.odds.money_line.home / 100) + 1 : 
+                        (100 / Math.abs(prediction.odds.money_line.home)) + 1;
+                } else {
+                    multiplier = prediction.odds.money_line.away > 0 ? 
+                        (prediction.odds.money_line.away / 100) + 1 : 
+                        (100 / Math.abs(prediction.odds.money_line.away)) + 1;
+                }
+                break;
+            case 'parlay':
+                // Calculate parlay odds (multiply all individual odds)
+                multiplier = 1;
+                document.querySelectorAll('#parlayGamesList input:checked').forEach(() => {
+                    multiplier *= 1.91; // Using standard odds for simplicity
+                });
+                break;
+        }
+
+        const potential = amount * multiplier;
+        potentialPayout.textContent = `Potential Payout: $${potential.toFixed(2)}`;
+    }
+
+    // Add bet amount change listener
+    betAmount.addEventListener('input', updatePotentialPayout);
+
+    // Handle bet placement
+    placeBetBtn.addEventListener('click', async function() {
+        try {
+            const betType = document.querySelector('input[name="betType"]:checked')?.value;
+            if (!betType) {
+                throw new Error('Please select a bet type');
+            }
+
+            const amount = parseFloat(betAmount.value);
+            if (!amount || amount <= 0) {
+                throw new Error('Please enter a valid bet amount');
+            }
+
+            let betData = {
+                type: betType,
+                amount: amount,
+                game_id: game.id,
+                prediction_id: prediction.id,
+                timestamp: new Date().toISOString()
+            };
+
+            switch(betType) {
+                case 'spread':
+                    const spreadTeam = document.querySelector('input[name="spreadTeam"]:checked')?.value;
+                    if (!spreadTeam) throw new Error('Please select a team for spread bet');
+                    betData.team = spreadTeam;
+                    betData.spread = prediction.point_spread;
+                    break;
+                case 'moneyline':
+                    const mlTeam = document.querySelector('input[name="moneyLineTeam"]:checked')?.value;
+                    if (!mlTeam) throw new Error('Please select a team for money line bet');
+                    betData.team = mlTeam;
+                    break;
+                case 'parlay':
+                    const parlaySelections = Array.from(document.querySelectorAll('#parlayGamesList input:checked'))
+                        .map(input => ({
+                            game_id: input.name.replace('parlay', ''),
+                            team: input.value
+                        }));
+                    if (parlaySelections.length === 0) throw new Error('Please select at least one game for parlay');
+                    betData.parlay_selections = parlaySelections;
+                    break;
+            }
+
+            // Store bet in the current predictions array
+            if (!window.currentPredictions) window.currentPredictions = [];
+            const predictionIndex = window.currentPredictions.findIndex(p => p.gameId === game.id);
+            if (predictionIndex !== -1) {
+                window.currentPredictions[predictionIndex].bet = betData;
+            }
+
+            // Close modal and show success message
+            predictionModal.hide();
+            alert('Bet placed successfully!');
+
+        } catch (error) {
+            alert(error.message);
+        }
+    });
+}
+
+// Update the makePrediction function to initialize betting form
+const originalUpdatePredictionDisplay = updatePredictionDisplay;
+updatePredictionDisplay = function(game, result) {
+    originalUpdatePredictionDisplay(game, result);
+    initializeBettingForm(game, result);
+};
+</script>
+{% endblock %}

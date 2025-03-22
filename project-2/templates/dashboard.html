@@ -1,0 +1,389 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-12 mb-4">
+        <h2>Prediction Accuracy Dashboard</h2>
+        <p class="lead">Model performance analysis and historical predictions</p>
+        <div class="alert alert-info" id="lastUpdate">
+            Loading last update time...
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Overall Prediction Accuracy</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="accuracyChart"></canvas>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Point Spread Accuracy</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="spreadChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- New row for trend charts -->
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Win Prediction Accuracy Trend</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="winAccuracyTrendChart"></canvas>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Spread Accuracy Trend</h5>
+            </div>
+            <div class="card-body">
+                <canvas id="spreadAccuracyTrendChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Yesterday's Predictions vs Results</h5>
+            </div>
+            <div class="card-body">
+                <div id="predictionResults" class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Game</th>
+                                <th>Predicted Winner</th>
+                                <th>Predicted Spread</th>
+                                <th>Actual Result</th>
+                                <th>Accuracy</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsTableBody">
+                            <tr>
+                                <td colspan="5" class="text-center">
+                                    <div class="spinner-border text-primary" role="status">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Load Chart.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+let accuracyChart = null;
+let spreadChart = null;
+let winAccuracyTrendChart = null;
+let spreadAccuracyTrendChart = null;
+
+async function initializeData() {
+    try {
+        console.log('Initializing application data...');
+        const response = await fetch('/api/initialize', {
+            method: 'POST'
+        });
+        if (!response.ok) {
+            throw new Error('Failed to initialize data');
+        }
+        console.log('Data initialization complete, fetching dashboard data...');
+        await fetchDashboardData();
+    } catch (error) {
+        console.error('Error initializing data:', error);
+        document.getElementById('lastUpdate').innerHTML = `
+            <div class="alert alert-danger">
+                Error initializing dashboard data. Please try refreshing the page.
+            </div>
+        `;
+    }
+}
+
+async function fetchDashboardData() {
+    try {
+        console.log('Fetching dashboard data...');
+        const response = await fetch('/api/dashboard/accuracy');
+        if (!response.ok) {
+            throw new Error('Failed to fetch dashboard data');
+        }
+        const data = await response.json();
+        console.log('Raw dashboard data received:', data);
+        updateDashboard(data);
+    } catch (error) {
+        console.error('Error:', error);
+        document.getElementById('resultsTableBody').innerHTML = `
+            <tr>
+                <td colspan="5" class="text-center text-danger">
+                    Error loading dashboard data. Please try again later.
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function updateDashboard(data) {
+    console.log('Starting dashboard update with data:', data);
+    console.log('Yesterday games:', data.yesterday_games);
+    console.log('Accuracy stats:', data.accuracy_stats);
+    console.log('Spread accuracy:', data.spread_accuracy);
+    console.log('Trends:', data.trends);
+
+    // Update last update time
+    const lastUpdateEl = document.getElementById('lastUpdate');
+    if (data.last_update) {
+        const lastUpdate = new Date(data.last_update);
+        lastUpdateEl.textContent = `Last updated: ${lastUpdate.toLocaleString()}`;
+    } else {
+        lastUpdateEl.textContent = 'Data last updated: Just now';
+    }
+
+    // Update results table
+    const tableBody = document.getElementById('resultsTableBody');
+    if (data.yesterday_games && data.yesterday_games.length > 0) {
+        console.log('Updating results table with games:', data.yesterday_games);
+        tableBody.innerHTML = data.yesterday_games.map(game => `
+            <tr class="${game.prediction_correct ? 'table-success' : 'table-danger'}">
+                <td>${game.home_team} vs ${game.away_team}</td>
+                <td>${game.predicted_winner}</td>
+                <td>${game.predicted_spread > 0 ? '+' : ''}${game.predicted_spread.toFixed(1)}</td>
+                <td>${game.actual_score}</td>
+                <td>
+                    <i class="fas fa-${game.prediction_correct ? 'check text-success' : 'times text-danger'}"></i>
+                    ${game.prediction_correct ? 'Correct' : 'Incorrect'}
+                </td>
+            </tr>
+        `).join('');
+    } else {
+        console.log('No games data available');
+        tableBody.innerHTML = `
+            <tr>
+                <td colspan="5" class="text-center">
+                    No prediction data available for yesterday
+                </td>
+            </tr>
+        `;
+    }
+
+    // Update accuracy chart
+    console.log('Updating accuracy chart with data:', data.accuracy_stats);
+    const accuracyCtx = document.getElementById('accuracyChart')?.getContext('2d');
+    if (!accuracyCtx) {
+        console.error('Could not get accuracy chart context');
+        return;
+    }
+
+    if (accuracyChart) {
+        accuracyChart.destroy();
+    }
+
+    accuracyChart = new Chart(accuracyCtx, {
+        type: 'doughnut',
+        data: {
+            labels: ['Correct', 'Incorrect'],
+            datasets: [{
+                data: [data.accuracy_stats.correct, data.accuracy_stats.incorrect],
+                backgroundColor: ['rgba(40, 167, 69, 0.2)', 'rgba(220, 53, 69, 0.2)'],
+                borderColor: ['rgba(40, 167, 69, 1)', 'rgba(220, 53, 69, 1)'],
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: {
+                    position: 'bottom'
+                },
+                title: {
+                    display: true,
+                    text: `Overall Accuracy: ${(data.accuracy_stats.accuracy * 100).toFixed(1)}%`
+                }
+            }
+        }
+    });
+
+    // Update spread chart
+    console.log('Updating spread chart with data:', data.spread_accuracy);
+    const spreadCtx = document.getElementById('spreadChart')?.getContext('2d');
+    if (!spreadCtx) {
+        console.error('Could not get spread chart context');
+        return;
+    }
+
+    if (spreadChart) {
+        spreadChart.destroy();
+    }
+
+    spreadChart = new Chart(spreadCtx, {
+        type: 'bar',
+        data: {
+            labels: data.spread_accuracy.ranges,
+            datasets: [{
+                label: 'Games within Spread Range',
+                data: data.spread_accuracy.counts,
+                backgroundColor: 'rgba(54, 162, 235, 0.2)',
+                borderColor: 'rgba(54, 162, 235, 1)',
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        stepSize: 1
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom'
+                },
+                title: {
+                    display: true,
+                    text: 'Point Spread Accuracy Distribution'
+                }
+            }
+        }
+    });
+
+    // Update win accuracy trend chart
+    console.log('Updating win accuracy trend chart with data:', data.trends);
+    const winTrendCtx = document.getElementById('winAccuracyTrendChart')?.getContext('2d');
+    if (!winTrendCtx) {
+        console.error('Could not get win trend chart context');
+        return;
+    }
+
+    if (winAccuracyTrendChart) {
+        winAccuracyTrendChart.destroy();
+    }
+
+    winAccuracyTrendChart = new Chart(winTrendCtx, {
+        type: 'line',
+        data: {
+            labels: data.trends.dates,
+            datasets: [{
+                label: 'Win Prediction Accuracy',
+                data: data.trends.win_accuracy.map(val => val * 100),
+                borderColor: 'rgba(40, 167, 69, 1)',
+                backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    max: 100,
+                    title: {
+                        display: true,
+                        text: 'Accuracy %'
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom'
+                }
+            }
+        }
+    });
+
+    // Update spread accuracy trend chart
+    console.log('Updating spread accuracy trend chart with data:', data.trends);
+    const spreadTrendCtx = document.getElementById('spreadAccuracyTrendChart')?.getContext('2d');
+    if (!spreadTrendCtx) {
+        console.error('Could not get spread trend chart context');
+        return;
+    }
+
+    if (spreadAccuracyTrendChart) {
+        spreadAccuracyTrendChart.destroy();
+    }
+
+    spreadAccuracyTrendChart = new Chart(spreadTrendCtx, {
+        type: 'line',
+        data: {
+            labels: data.trends.dates,
+            datasets: [{
+                label: 'Average Spread Error',
+                data: data.trends.spread_accuracy,
+                borderColor: 'rgba(54, 162, 235, 1)',
+                backgroundColor: 'rgba(54, 162, 235, 0.1)',
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: {
+                        display: true,
+                        text: 'Points'
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom'
+                }
+            }
+        }
+    });
+}
+
+// Initialize data and start refresh cycle when page loads
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('DOM loaded, initializing data...');
+    initializeData();
+});
+
+// Schedule next update at midnight
+function scheduleNextUpdate() {
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+
+    const timeUntilMidnight = tomorrow - now;
+    setTimeout(() => {
+        initializeData();  // Run full initialization at midnight
+        scheduleNextUpdate();
+    }, timeUntilMidnight);
+}
+
+// Start the daily refresh cycle
+scheduleNextUpdate();
+
+// Also refresh every 5 minutes during active viewing
+setInterval(initializeData, 300000);
+</script>
+{% endblock %}
