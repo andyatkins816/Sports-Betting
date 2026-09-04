@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Sequence
 
 
 def _validate(probabilities: Sequence[float], outcomes: Sequence[int]) -> None:

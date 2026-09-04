@@ -54,3 +54,15 @@ class TheOddsApiProviderTests(unittest.TestCase):
     def test_parser_rejects_sport_mismatch(self):
         with self.assertRaises(TheOddsApiError):
             TheOddsApiClient.parse_response(self.payload, sport_key="baseball_mlb", now=self.now)
+
+    def test_client_rejects_unpinned_or_non_https_provider_endpoint(self):
+        class UnsafeClient(TheOddsApiClient):
+            base_url = "http://not-the-odds-api.example/v4"
+
+        with self.assertRaises(TheOddsApiError):
+            UnsafeClient("test-key")
+
+    def test_fetch_rejects_sport_key_that_could_change_the_request_path(self):
+        client = TheOddsApiClient("test-key")
+        with self.assertRaises(ValueError):
+            client.fetch_pregame_odds("basketball_nba/../other")

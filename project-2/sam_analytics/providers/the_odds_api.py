@@ -10,18 +10,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from sam_analytics.ingestion import RawOddsQuote
 
 
 class TheOddsApiError(RuntimeError):
     """A provider failure safe to log without exposing an API key or URL."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Reject redirects so a query-string provider key cannot leave the pinned host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
 
 
 @dataclass(frozen=True)
@@ -35,11 +43,13 @@ class OddsApiFetch:
 
 class TheOddsApiClient:
     base_url = "https://api.the-odds-api.com/v4"
+    expected_host = "api.the-odds-api.com"
     supported_featured_markets = frozenset({"h2h", "spreads", "totals"})
 
     def __init__(self, api_key: str, *, timeout_seconds: float = 10.0):
         if not api_key or not api_key.strip():
             raise ValueError("The Odds API key is required")
+        _validate_provider_base_url(self.base_url, self.expected_host)
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
 
@@ -55,6 +65,8 @@ class TheOddsApiClient:
         requested_markets = tuple(markets)
         if not sport_key or not regions:
             raise ValueError("sport_key and regions are required")
+        if not _SPORT_KEY.fullmatch(sport_key):
+            raise ValueError("sport_key must contain only lowercase letters, digits, and underscores")
         if not requested_markets or not set(requested_markets) <= self.supported_featured_markets:
             raise ValueError("only featured markets h2h, spreads, and totals are supported in this endpoint")
         now = now or datetime.now(timezone.utc)
@@ -135,9 +147,11 @@ class TheOddsApiClient:
     def _request(self, path: str, params: Mapping[str, str]) -> tuple[Any, Mapping[str, str]]:
         # Do not log request URLs: The provider requires the API key in the query string.
         url = f"{self.base_url}{path}?{urlencode(params)}"
+        _validate_provider_request_url(url, self.expected_host)
         request = Request(url, headers={"Accept": "application/json"})
+        opener = build_opener(_NoRedirect())
         try:
-            with urlopen(request, timeout=self._timeout_seconds) as response:
+            with opener.open(request, timeout=self._timeout_seconds) as response:
                 if response.status != 200:
                     raise TheOddsApiError(f"The Odds API returned HTTP {response.status}")
                 raw_payload = response.read()
@@ -150,6 +164,39 @@ class TheOddsApiClient:
             raise TheOddsApiError(f"The Odds API returned HTTP {error.code}") from error
         except (URLError, OSError) as error:
             raise TheOddsApiError("The Odds API request failed") from error
+
+
+_SPORT_KEY = re.compile(r"^[a-z0-9_]{1,100}$")
+
+
+def _validate_provider_base_url(value: object, expected_host: str) -> None:
+    if not isinstance(value, str):
+        raise TheOddsApiError("The Odds API endpoint is invalid")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != expected_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/v4")
+    ):
+        raise TheOddsApiError("The Odds API endpoint is not the approved HTTPS host")
+
+
+def _validate_provider_request_url(value: str, expected_host: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != expected_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or parsed.fragment
+    ):
+        raise TheOddsApiError("The Odds API request is not directed to the approved HTTPS host")
 
 
 def _required_text(data: Mapping[str, Any], key: str) -> str:
