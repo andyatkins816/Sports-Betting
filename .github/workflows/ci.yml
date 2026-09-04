@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: sam
+          POSTGRES_USER: sam
+          POSTGRES_PASSWORD: sam-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sam -d sam"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: project-2/pyproject.toml
+      - name: Install
+        working-directory: project-2
+        run: python -m pip install --upgrade pip && python -m pip install -e '.[dev,modeling]'
+      - name: Apply PostgreSQL migrations
+        working-directory: project-2
+        env:
+          DATABASE_URL: postgresql://sam:sam-ci-password@127.0.0.1:5432/sam
+        run: python -m sam_analytics.migrate
+      - name: Lint
+        working-directory: project-2
+        run: ruff check .
+      - name: Test
+        working-directory: project-2
+        run: pytest
+      - name: Security scan
+        working-directory: project-2
+        run: bandit -q -r sam_analytics routes app.py worker.py
+      - name: Build container
+        run: docker build --tag sam-analytics:${{ github.sha }} project-2

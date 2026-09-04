@@ -1,50 +1,61 @@
-import os
+"""Flask application factory for SAM Analytics.
+
+The old application imported model classes and provider clients at module load,
+which made every web request depend on unvalidated demo data. The factory now
+starts only the reviewable API surface; ingestion and model jobs run in workers.
+"""
+
+from __future__ import annotations
+
 import logging
-from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import DeclarativeBase
+import uuid
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+from flask import Flask, g, request
 
-class Base(DeclarativeBase):
-    pass
+from sam_analytics.settings import Settings
 
-db = SQLAlchemy(model_class=Base)
 
-def create_app():
-    # Create Flask app
+def create_app(settings: Settings | None = None) -> Flask:
+    settings = settings or Settings.from_environment()
     app = Flask(__name__)
+    app.config.update(
+        ENVIRONMENT=settings.environment,
+        SECRET_KEY=settings.secret_key or "development-only-not-for-production",
+        SAM_SETTINGS=settings,
+        MAX_CONTENT_LENGTH=64 * 1024,
+    )
+    app.json.sort_keys = False
+    app.logger.setLevel(logging.INFO if settings.is_production else logging.DEBUG)
 
-    # Configure app
-    app.secret_key = os.environ.get("SESSION_SECRET", "dev_secret_key")
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get("DATABASE_URL")
-    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-        "pool_recycle": 300,
-        "pool_pre_ping": True,
-    }
+    @app.before_request
+    def attach_request_id() -> None:
+        # Do not trust a client-provided identifier for logs or audit correlation.
+        g.request_id = str(uuid.uuid4())
 
-    # Initialize extensions
-    db.init_app(app)
+    @app.after_request
+    def security_headers(response):
+        response.headers["X-Request-ID"] = g.get("request_id", "")
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; base-uri 'self'; frame-ancestors 'none'"
+        if request.is_secure or settings.is_production:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        origin = request.headers.get("Origin")
+        if origin and origin in settings.allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Vary"] = "Origin"
+        return response
 
-    with app.app_context():
-        # Import and register blueprints
-        from routes.views import bp as views_bp
-        app.register_blueprint(views_bp)
+    from routes.api import bp as api_bp
+    from routes.views import bp as views_bp
 
-        from routes.api import bp as api_bp
-        app.register_blueprint(api_bp)
+    app.register_blueprint(api_bp)
+    app.register_blueprint(views_bp)
+    return app
 
-        # Create database tables
-        db.create_all()
 
-        # Log registered routes for debugging
-        logger.debug("Registered routes:")
-        for rule in app.url_map.iter_rules():
-            logger.debug(f"{rule.endpoint}: {rule.rule}")
-
-        return app
-
-# Create the application instance
+# Flask and Gunicorn entry point. Validation remains fail-closed in production.
 app = create_app()
