@@ -105,10 +105,10 @@ def probe_postgres(database_url: str) -> DatabaseReadiness:
         return _database_not_ready()
     finally:
         if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
+            # A close failure is deliberately allowed to reach
+            # ``check_dependencies``. It then reports the dependency as not
+            # ready instead of hiding an indeterminate connection state.
+            connection.close()
 
 
 def probe_redis(redis_url: str) -> bool:
@@ -129,10 +129,9 @@ def probe_redis(redis_url: str) -> bool:
         return False
     finally:
         if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+            # As with PostgreSQL, a close failure fails closed through the
+            # bounded caller instead of being silently discarded.
+            client.close()
 
 
 def _database_not_ready() -> DatabaseReadiness:
