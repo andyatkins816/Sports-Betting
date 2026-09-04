@@ -14,6 +14,7 @@ from typing import Any, Dict
 from flask import Blueprint, current_app, jsonify, request
 
 from sam_analytics.odds import american_to_decimal, expected_roi, implied_probability
+from sam_analytics.readiness import DependencyReadiness, check_dependencies
 from sam_analytics.risk import BankrollPolicy, ExposureState, size_moneyline
 from sam_analytics.service_contract import OperationalSignals, build_integration_status
 
@@ -33,6 +34,20 @@ def protect_versioned_api_responses(response):
 def healthz():
     """Liveness probe; never reveals credentials or provider status."""
     return jsonify({"status": "ok", "service": "sam-analytics"})
+
+
+@bp.get("/readyz")
+def readyz():
+    """Readiness probe that fails closed without exposing infrastructure facts."""
+
+    settings = current_app.config["SAM_SETTINGS"]
+    probe = current_app.config.get("SAM_DEPENDENCY_READINESS_PROBE", check_dependencies)
+    try:
+        result = probe(settings.database_url, settings.redis_url)
+    except Exception:
+        result = None
+    is_ready = isinstance(result, DependencyReadiness) and result.ready
+    return jsonify({"status": "ready" if is_ready else "not_ready"}), 200 if is_ready else 503
 
 
 @bp.get("/v1/integration/status")

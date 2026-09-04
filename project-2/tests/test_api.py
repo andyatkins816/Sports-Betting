@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from app import create_app
+from sam_analytics.readiness import DependencyReadiness
 from sam_analytics.settings import Settings
 
 
@@ -25,6 +26,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.get_json()["status"], "ok")
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(self.client.get("/api/simulate_predictions").status_code, 410)
+
+    def test_readiness_fails_closed_without_live_dependencies(self):
+        response = self.client.get("/api/readyz")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json(), {"status": "not_ready"})
+
+    def test_readiness_reports_only_safe_status_after_dependency_probes_pass(self):
+        app = create_app(
+            Settings(
+                environment="test",
+                secret_key="test-secret",
+                api_key=None,
+                database_url="postgresql://database-secret",
+                redis_url="redis://queue-secret",
+                allowed_origins=(),
+                quote_max_age_seconds=300,
+            )
+        )
+        app.config["SAM_DEPENDENCY_READINESS_PROBE"] = lambda *_: DependencyReadiness(
+            database_reachable=True,
+            migrations_current=True,
+            queue_reachable=True,
+        )
+        response = app.test_client().get("/api/readyz")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "ready"})
+        self.assertNotIn("secret", response.get_data(as_text=True))
 
     def test_evaluation_requires_timestamped_quote_and_model_version(self):
         response = self.client.post(
@@ -86,6 +114,33 @@ class ApiTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "SESSION_SECRET"):
             settings.validate()
+
+    def test_production_requires_status_key_and_safe_origins(self):
+        settings = Settings(
+            environment="production",
+            secret_key="x" * 32,
+            api_key="research-key",
+            status_api_key=None,
+            database_url="postgresql://database",
+            redis_url="redis://queue",
+            allowed_origins=("https://sam.vegas",),
+            quote_max_age_seconds=300,
+        )
+        with self.assertRaisesRegex(ValueError, "SAM_STATUS_API_KEY"):
+            settings.validate()
+
+        unsafe_origins = Settings(
+            environment="production",
+            secret_key="x" * 32,
+            api_key="research-key",
+            status_api_key="status-key",
+            database_url="postgresql://database",
+            redis_url="redis://queue",
+            allowed_origins=("http://sam.vegas/path",),
+            quote_max_age_seconds=300,
+        )
+        with self.assertRaisesRegex(ValueError, "ALLOWED_ORIGINS"):
+            unsafe_origins.validate()
 
     def test_status_gateway_key_cannot_invoke_research_evaluation(self):
         settings = Settings(
