@@ -1,68 +1,24 @@
-# NBA Prediction System
+# SAM Analytics service
 
-A cutting-edge multi-sport predictive analytics platform that combines advanced AI technologies with comprehensive betting tracking capabilities.
+This directory contains the Flask API, research primitives, database migration,
+container image, and worker entry point for SAM Analytics.
 
-## Features
+`sam_analytics/` contains deterministic domain logic and a narrowly scoped
+The Odds API v4 pregame adapter. The adapter preserves provider IDs/timestamps,
+filters live events, and exposes quota headers; it does not train on samples or
+place wagers. Other provider adapters belong in separately reviewed worker
+modules after their data contracts are licensed.
 
-- Game outcome predictions with AI-powered analysis
-- Real-time betting tracking and management
-- Multiple bet types supported:
-  - Point spread betting
-  - Money line betting
-  - Parlay betting
-- Interactive dashboard with performance metrics
-- AI-powered betting suggestions
-- Historical performance tracking
+The public integration surface is GET /api/v1/integration/status, protected by
+a dedicated status-only credential and limited to a sanitized readiness
+contract. POST /api/v1/evaluate remains a development/test research harness
+only; production disables it because a caller must not supply a probability,
+quote, bankroll, policy, or approval label. Production serving will resolve
+immutable Python-generated predictions, quotes, portfolio exposure, policy, and
+approved artifact identity server-side.
 
-## Tech Stack
+The `models/` and `services/` folders are legacy source retained temporarily for
+audit traceability. They are deliberately not wired into `app.py`.
 
-- Python Flask backend
-- Bootstrap for frontend styling
-- Chart.js for data visualization
-- SQLAlchemy for database management
-- Machine learning integration for predictions
-
-## Setup
-
-1. Clone the repository
-```bash
-git clone https://github.com/yourusername/nba-prediction-system.git
-cd nba-prediction-system
-```
-
-2. Install dependencies
-```bash
-pip install -r requirements.txt
-```
-
-3. Set up environment variables:
-```
-DATABASE_URL=your_database_url
-NBA_API_KEY=your_api_key
-OPENAI_API_KEY=your_openai_key
-```
-
-4. Run the application
-```bash
-python main.py
-```
-
-The application will be available at `http://localhost:5000`
-
-## Usage
-
-1. **View Predictions**: Navigate to the Predictions page to see upcoming games and make predictions
-2. **Track Bets**: After making a prediction, use the bet tracking feature to monitor your wagers
-3. **Dashboard**: Check the dashboard for prediction accuracy and betting performance metrics
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+See the repository README and docs/ for the required governance and deployment
+process.

@@ -1,0 +1,22 @@
+body {
+  max-width: 46rem;
+  margin: 8vh auto;
+  padding: 0 1.5rem;
+  color: #172033;
+  font: 18px/1.55 system-ui, sans-serif;
+}
+
+h1 {
+  letter-spacing: -0.04em;
+}
+
+.notice {
+  padding: 1rem 1.25rem;
+  border-left: 0.3rem solid #345;
+  background: #f2f6fb;
+}
+
+code {
+  padding: 0.12rem 0.25rem;
+  background: #f2f2f2;
+}
