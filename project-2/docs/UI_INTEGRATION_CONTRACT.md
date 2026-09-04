@@ -7,7 +7,7 @@ profit claim when the backend has not supplied one.
 ## Endpoint
 
 `GET /api/v1/integration/status` is an authenticated, versioned status
-contract for a trusted UI gateway. Send the configured `SAM_API_KEY` only in an
+contract for a trusted UI gateway. Send the configured `SAM_STATUS_API_KEY` only in an
 `X-API-Key` request header from a server-side integration function. It returns
 `Cache-Control: no-store` and never includes credentials, database URLs, raw
 odds, predictions, customer data, or provider payloads.
@@ -16,7 +16,7 @@ The unauthenticated `GET /api/healthz` endpoint is a liveness probe only. It
 does not establish data or model readiness.
 
 Base44 should use a backend function as the gateway. Store the Python API URL
-and `SAM_API_KEY` in Base44's server-side secret store; do not place either in
+and `SAM_STATUS_API_KEY` in Base44's server-side secret store; do not place either in
 React code, browser storage, an AI-agent prompt, or a client-visible entity.
 Pass the sanitized status response to the UI or evidence assistant instead.
 

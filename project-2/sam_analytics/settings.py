@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
@@ -64,5 +65,26 @@ class Settings:
                 raise ValueError("SESSION_SECRET must be at least 32 characters in production")
             if not self.api_key:
                 raise ValueError("SAM_API_KEY is required in production")
+            if not self.status_api_key:
+                raise ValueError("SAM_STATUS_API_KEY is required in production")
             if not self.database_url or not self.redis_url:
                 raise ValueError("DATABASE_URL and REDIS_URL are required in production")
+            if not self.allowed_origins:
+                raise ValueError("ALLOWED_ORIGINS must contain at least one HTTPS origin in production")
+            if any(not _is_https_origin(origin) for origin in self.allowed_origins):
+                raise ValueError("ALLOWED_ORIGINS must contain only HTTPS origins without paths in production")
+
+
+def _is_https_origin(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+    )
