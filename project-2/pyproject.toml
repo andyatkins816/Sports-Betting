@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Auditable, provider-neutral sports-market research backend"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {file = "LICENSE"}
+license = "MIT"
 dependencies = [
     "alembic>=1.14,<2",
     "celery[redis]>=5.4,<6",
@@ -30,6 +30,13 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.8,<1",
 ]
+
+# This repository deliberately keeps the Flask entry points, templates, and
+# deployment files alongside the installable analytics library.  Restrict
+# setuptools discovery to the library so it never mistakes those application
+# directories for independently installable top-level packages.
+[tool.setuptools.packages.find]
+include = ["sam_analytics*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
