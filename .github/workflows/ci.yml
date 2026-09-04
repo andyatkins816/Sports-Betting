@@ -60,3 +60,22 @@ jobs:
         run: bandit -q -r sam_analytics routes app.py worker.py
       - name: Build container
         run: docker build --tag sam-analytics:${{ github.sha }} project-2
+      - name: Smoke-test container
+        run: |
+          docker run --detach --name sam-ci \
+            --env PORT=10000 \
+            --env APP_ENV=staging \
+            --env SESSION_SECRET=ci-session-secret-at-least-32-characters \
+            --env SAM_API_KEY=ci-research-key \
+            --env SAM_STATUS_API_KEY=ci-status-key-is-distinct \
+            --publish 10000:10000 sam-analytics:${{ github.sha }}
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:10000/api/healthz; then
+              docker stop sam-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs sam-ci
+          docker stop sam-ci
+          exit 1
