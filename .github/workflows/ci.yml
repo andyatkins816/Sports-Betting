@@ -52,7 +52,9 @@ jobs:
         run: ruff check --select E,F --ignore E501 sam_analytics routes/api.py app.py worker.py
       - name: Test
         working-directory: project-2
-        run: pytest
+        # `python -m` preserves this application directory on the import
+        # path, allowing tests to exercise the API entry point as deployed.
+        run: python -m pytest
       - name: Security scan
         working-directory: project-2
         run: bandit -q -r sam_analytics routes app.py worker.py
