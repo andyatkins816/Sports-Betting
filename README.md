@@ -22,7 +22,12 @@ The current implementation provides:
 - probability calibration, proper scoring rules, and chronological backtesting
   that rejects timestamp look-ahead;
 - a fail-closed production configuration, hardened API defaults, container
-  runtime, worker/scheduler separation, initial PostgreSQL audit schema, and CI;
+  runtime, worker separation, immutable PostgreSQL receipt/provenance schema,
+  and CI;
+- a private, content-addressed raw-payload boundary and transactional odds
+  ledger that retain corrections and provenance without exposing raw provider
+  data; the provider worker remains deliberately disabled until private object
+  storage and an approved provider contract are configured;
 - a single analytical endpoint, `POST /api/v1/evaluate`, which never places a
   bet or records a fictional result.
 
@@ -48,7 +53,8 @@ that compose file as the production secret-management plan.
 - [Audit and remediation status](project-2/docs/AUDIT_2026-09-04.md)
 - [Data, model, backtest, and risk governance](project-2/docs/DATA_AND_MODEL_GOVERNANCE.md)
 - [sam.vegas deployment runbook](project-2/docs/DEPLOYMENT_SAM_VEGAS.md)
-- [PostgreSQL audit schema](project-2/migrations/001_initial.sql)
+- [PostgreSQL audit schema](project-2/migrations/001_initial.sql) and
+  [provider-receipt lineage migration](project-2/migrations/004_provider_payload_receipts.sql)
 
 ## Non-negotiable operating rules
 

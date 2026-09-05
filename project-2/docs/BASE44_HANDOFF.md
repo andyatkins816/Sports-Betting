@@ -6,6 +6,20 @@ feed, calibration report, risk gate, or incident in plain language. It cannot
 invent an edge, estimate missing odds, create a pick, or bypass a Python-side
 publication gate.
 
+## Current rollout position
+
+Base44 remains SAM's public UI at `sam.vegas`; the Python service is not a
+replacement for that site. `sam-api` is deployed on Render in staging and its
+liveness and dependency-readiness endpoints have passed against private
+Postgres and Key Value. The immutable object store, worker, licensed feed, and
+approved-model gates are not yet live. Base44 must therefore continue to show a
+transparent unavailable or blocked state until those independent gates are
+complete.
+
+`api.sam.vegas` is reserved for Render. Do not configure Base44's production
+status gateway until Render has validated the GoDaddy DNS record and HTTPS for
+that hostname. See `DEPLOYMENT_SAM_VEGAS.md` for the cutover sequence.
+
 ## Safe connection one: Base44 reads Python status
 
 The Base44 server function sam-backend-status calls the Python status endpoint.
@@ -20,6 +34,10 @@ The status function pins the hostname, requires HTTPS, rejects redirects and
 non-JSON/oversized responses, and projects a fixed nested schema before any
 value reaches the UI or evidence assistant. The status key cannot call the
 private research evaluator.
+
+`SAM_API_KEY` is not a Base44 secret and must not be sent to the status endpoint.
+It is separate from `SAM_STATUS_API_KEY` and reserved for private research
+capabilities, which are disabled outside development/test.
 
 ## Safe connection two: Python publishes evidence to Base44
 
@@ -58,15 +76,19 @@ betting prediction or turn a probability into a recommendation.
 
 ## Rollout order
 
-1. Deploy the Python API, private worker, Postgres, Redis or Valkey, and object
-   storage. Run numbered migrations through the included migration runner.
-2. Rotate the Odds API credential that was shared in chat. Store its replacement
+1. Keep Base44 at `sam.vegas`; deploy and verify Render `sam-api` separately.
+2. Connect Render Postgres through its internal URL, run reviewed migrations,
+   and test restoration before accepting provider data.
+3. Add Render Key Value, a private worker/scheduler, and private object storage
+   only after their persistence, retry, lineage, and monitoring controls exist.
+4. Rotate the Odds API credential that was shared in chat. Store its replacement
    only in the worker's host secret manager.
-3. Configure the status secrets and confirm Base44 displays blocked until real
-   operational evidence exists.
-4. Configure the webhook secret on both sides and publish one harmless
-   provider_notice or risk_gate record from a private worker.
-5. Add licensed feed storage, a feature contract, frozen backtest, calibration
+5. Configure `api.sam.vegas` in Render and GoDaddy, wait for HTTPS validation,
+   then configure the three Base44 status secrets above.
+6. Confirm Base44 displays `blocked` until real operational evidence exists.
+7. Configure the separate webhook secret on both sides and publish one harmless
+   `provider_notice` or `risk_gate` record from a private worker.
+8. Add licensed feed storage, a feature contract, frozen backtest, calibration
    report, artifact checksum, and approval decision.
-6. Enable a model release only after every gate passes. Withhold publication
+9. Enable a model release only after every gate passes. Withhold publication
    whenever a gate fails.
