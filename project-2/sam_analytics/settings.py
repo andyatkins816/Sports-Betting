@@ -7,11 +7,45 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 
-_PRIVATE_WORKER_ONLY_SECRET_NAMES = (
+_PRIVATE_WORKER_ONLY_SETTING_NAMES = (
+    "SAM_WORKER_ROLE",
+    "SAM_WORKER_MODE",
+    "SAM_INGESTION_ENABLED",
+    "SAM_RAW_EVIDENCE_STORE_URI",
+    "SAM_RAW_EVIDENCE_STORE_BACKEND",
+    "SAM_RAW_EVIDENCE_S3_REGION",
+    "SAM_RAW_EVIDENCE_S3_ENDPOINT_URL",
+    "SAM_RAW_EVIDENCE_MAX_BYTES",
+    "ODDS_PROVIDER",
     "ODDS_PROVIDER_API_KEY",
+    "NFL_API_KEY",
+    "OPENAI_API_KEY",
+    "RESULTS_PROVIDER",
     "RESULTS_PROVIDER_API_KEY",
     "SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID",
     "SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+    "CLOUDFLARE_API_USER_SERVICE_KEY",
+    "CLOUDFLARE_EMAIL",
+    "CF_API_TOKEN",
+    "CF_API_KEY",
+    "CF_API_USER_SERVICE_KEY",
+    "CF_API_EMAIL",
 )
 
 
@@ -36,7 +70,7 @@ class Settings:
         environment = os.getenv("APP_ENV", "development").lower()
         if environment not in {"development", "test", "staging", "production"}:
             raise ValueError("APP_ENV must be development, test, staging, or production")
-        _reject_private_worker_only_secrets(environment)
+        _reject_unsafe_live_process_settings(environment)
         secret_key = os.getenv("SESSION_SECRET", "")
         api_key = os.getenv("SAM_API_KEY") or None
         status_api_key = os.getenv("SAM_STATUS_API_KEY") or None
@@ -84,21 +118,38 @@ class Settings:
                 raise ValueError("ALLOWED_ORIGINS must contain only HTTPS origins without paths in production")
 
 
-def _reject_private_worker_only_secrets(environment: str) -> None:
-    """Keep provider and evidence-store credentials out of the web process.
+def _reject_unsafe_live_process_settings(environment: str) -> None:
+    """Keep worker authority and ambient connection overrides out of the web process.
 
     Development and test can carry fixture configuration without making an
     operator's staging/production deployment fail unexpectedly.  The live web
-    service, however, must fail closed rather than silently retain credentials
-    that belong exclusively to a future private ingestion worker.  Do not name
+    service, however, must fail closed rather than silently retain settings
+    that belong exclusively to the private ingestion worker.  Do not name
     or echo a configured value in the error: callers and process supervisors
     may surface the message in logs.
     """
 
     if environment not in {"staging", "production"}:
         return
-    if any((os.getenv(name) or "").strip() for name in _PRIVATE_WORKER_ONLY_SECRET_NAMES):
-        raise ValueError("private worker-only credentials cannot be configured in the web process")
+    has_worker_setting = any(
+        (os.getenv(name) or "").strip()
+        for name in _PRIVATE_WORKER_ONLY_SETTING_NAMES
+    )
+    has_ambient_connection_setting = any(
+        isinstance(name, str)
+        and (
+            name.upper().startswith("PG")
+            or name.upper().startswith("CELERY_")
+        )
+        and isinstance(value, str)
+        and bool(value.strip())
+        for name, value in os.environ.items()
+    )
+    if has_worker_setting or has_ambient_connection_setting:
+        raise ValueError(
+            "worker-only or ambient connection settings cannot be configured "
+            "in the web process"
+        )
 
 
 def _is_https_origin(value: object) -> bool:

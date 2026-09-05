@@ -24,11 +24,14 @@ services:
 
   worker:
     build: ./project-2
-    command: celery -A worker.celery_app worker --loglevel=INFO
-    # This is intentionally opt-in.  The current worker fails closed until a
-    # separately reviewed private-ingestion release is available.
+    command: >-
+      celery -A worker:celery_app worker --loglevel=INFO --concurrency=1
+      --queues=sam_manual_shadow --without-gossip --without-mingle
+    # This remains opt-in and uses a worker-only environment file. The sole
+    # admitted task writes deterministic synthetic bytes; it never polls a
+    # provider or runs on a schedule.
     profiles: ["private-worker"]
-    env_file: .env
+    env_file: .env.worker
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -1,62 +1,139 @@
 # Private worker admission boundary
 
-`worker.py` is deliberately **not** a general-purpose Celery entry point.
-It refuses to start unless all of the following are present in the worker's
-own secret/configuration group:
+`worker.py` is deliberately **not** a general-purpose Celery entry point. This
+release admits exactly one staging-only synthetic storage probe. It does not
+authorize a provider request, odds ingestion, event settlement, model training,
+or scheduled work.
 
-| Setting | Required value | Why it is required |
-| --- | --- | --- |
-| `SAM_WORKER_ROLE` | `private_ingestion` | Prevents an accidental generic or public-worker deployment. |
-| `DATABASE_URL` | Render's internal PostgreSQL URL | The evidence ledger cannot exist without durable PostgreSQL persistence. |
-| `REDIS_URL` | Render's internal Key Value URL | Provides the private task broker. |
-| `SAM_RAW_EVIDENCE_STORE_URI` | A secret-free `s3://bucket/prefix` URI | Declares the dedicated private raw-evidence location before a worker can run. |
-| `SAM_INGESTION_ENABLED` | `false` or absent | This release has no provider polling implementation. `true` is refused. |
+## Exact admitted configuration
 
-The URI must have a bucket and non-empty prefix, with no credentials, port,
-query string, fragment, or `.`/`..` path component. It is a stable object-store
-reference—not a public or signed download URL. Use lowercase S3-compatible
-bucket/prefix names; reserve the `sha256` path segment for the immutable
-content-addressed object key that SAM creates.
+The worker refuses to start unless its private environment group contains this
+exact non-secret boundary:
 
-The current worker also refuses to start if a web/API, provider, or
-object-store credential is present. That is intentional: credentials in an
-inert worker create an unnecessary chance of accidental consumption or
-disclosure. The worker has no provider import, no provider request path, no
-periodic schedule, and no Celery Beat schedule. A manually dispatched ingest
-or settlement task also fails visibly rather than reporting a misleading
-successful no-op.
+| Setting | Required value |
+| --- | --- |
+| `APP_ENV` | `staging` |
+| `SAM_WORKER_ROLE` | `private_ingestion` |
+| `SAM_WORKER_MODE` | `synthetic_storage_probe` |
+| `DATABASE_URL` | Render's internal PostgreSQL URL |
+| `REDIS_URL` | Render's internal Key Value URL |
+| `SAM_INGESTION_ENABLED` | `false` or absent |
+| `SAM_RAW_EVIDENCE_STORE_BACKEND` | `cloudflare_r2` |
+| `SAM_RAW_EVIDENCE_STORE_URI` | `s3://sam-raw-evidence-staging/raw/synthetic` |
+| `SAM_RAW_EVIDENCE_S3_REGION` | `auto` |
+| `SAM_RAW_EVIDENCE_S3_ENDPOINT_URL` | The account's official HTTPS R2 S3 endpoint |
+| `SAM_RAW_EVIDENCE_MAX_BYTES` | `1048576` |
 
-## What this does and does not prove
+`DATABASE_URL` and `REDIS_URL` are admitted only with Render's single-label
+internal host forms (`dpg-...` and `red-...`). Explicit loopback and Compose
+service aliases are also allowed for isolated CI/local verification. Public
+Render hosts and arbitrary internet hostnames fail worker admission.
 
-This is an **admission guard**, not a live ingestion path. It verifies that
-the worker was explicitly configured for a private object-store prefix; it
-does not prove the provider has blocked public access, enabled encryption, or
-given the worker least-privilege access. The deployment must establish those
-controls before the existing storage adapter is wired into an ingestion task.
+A non-empty R2 S3 access-key pair is also required, but the settings object
+does not retain it. The pair must come from an **Object Read & Write** token
+restricted to `sam-raw-evidence-staging`. Cloudflare's standard permission
+bundles object listing, and its write category should be assumed to allow copy
+and deletion, even though this worker never calls those operations. Before
+creating the token, add a seven-day bucket-lock rule for `raw/synthetic/`;
+choose a time-limited TTL if the dashboard offers one and revoke it immediately
+after the one probe. Bucket-level token scope plus the prefix retention rule are
+the security boundary because the standard R2 token cannot restrict access to
+`raw/synthetic` alone. Never include `sam-raw-evidence-prod`.
 
-Do not create a paid Background Worker just to run this inert release. Wait
-for the reviewed ledger integration and bounded dispatcher. At that point, the
-service must be a Render **Background Worker**, not a Web Service, and it must
-not receive a public URL.
+The worker rejects provider credentials, public API/session credentials,
+Base44 settings, ambient AWS credentials, and Cloudflare account-administration
+credentials. In addition to known names, any configured environment variable
+whose name looks like an API key, token, secret, password, authorization value,
+credential, cookie, or bearer value is rejected unless it is one of the exact
+two R2 credential names above. It also rejects production mode, the production
+bucket, a generic S3 backend, a larger payload limit, or any live-ingestion
+switch. Error text never includes the rejected name or value.
 
-## Next infrastructure checkpoint
+Use `.env.worker.example` as the shape for local review. Never copy the public
+API's environment group into this worker, never add worker settings to
+`sam-api`, and never commit a populated `.env.worker` file.
 
-Before a future ingestion release, create private object storage with a
-dedicated prefix for raw odds evidence. Confirm all of the following outside
-this codebase:
+## What the probe does
 
-1. Anonymous listing and object reads are blocked.
-2. Encryption at rest and HTTPS-only access are enabled.
-3. Versioning or a write-once/retention control is enabled where the provider
-   agreement and storage provider support it.
-4. A worker-only service identity is limited to the exact evidence prefix;
-   `sam-api` receives no broad object-store credential.
-5. The provider's current retention, derived-data, display, and
-   redistribution rights have been recorded in the approved contract.
+The sole admitted task is zero-argument and manual-only. At execution time it
+revalidates the complete boundary, uses Celery's generated task ID as a safe
+job identity, and, while each dependency remains available:
 
-The repository includes a concrete S3-compatible `RawPayloadStore` boundary,
-but it is deliberately not constructed by `worker.py` or wired to
-`OddsLedger` yet. After the storage checkpoint, the next reviewed change must
-exercise that adapter against the selected provider, wire it into the ledger,
-and introduce a single bounded dispatcher. Only then should a replacement
-provider credential be placed in the private worker's secret store.
+1. commits an append-only `queued` audit fact to PostgreSQL;
+2. commits `running` before any object-store write;
+3. stores one fixed, versioned synthetic JSON fixture under the staging
+   content-addressed prefix;
+4. verifies the object with `HeadObject` and a bounded `GetObject` SHA-256
+   read; and
+5. attempts to commit `succeeded`, or an enumerated safe failure.
+
+The approved fixture is exactly 61 bytes and has SHA-256
+`5dc961d33ef2a18a1e47b6ffc52475bf0442bf7ba3959787a4718e5fd5015aa1`.
+That pins its private content-addressed key under
+`raw/synthetic/sha256/<digest>` without disclosing any credential or endpoint.
+
+It returns no payload, object URL, digest, credential, or provider content.
+The storage adapter never lists or deletes objects, changes an ACL, or creates
+a public/presigned URL. Repeating the probe verifies the same content-addressed
+object rather than accumulating synthetic files.
+
+`ingest_quotes` and `settle_events` remain visibly inert. The worker imports no
+provider client and cannot write synthetic odds, events, or snapshots through
+`OddsLedger`.
+
+## Manual-only delivery controls
+
+The probe uses the dedicated `sam_manual_shadow` queue with concurrency one.
+Celery result storage, automatic retries, late acknowledgement, worker-lost
+redelivery, missing-queue creation, and Beat scheduling are disabled. The
+checked-in Compose worker remains behind the opt-in `private-worker` profile
+and reads a separate `.env.worker` file.
+
+Start the reviewed worker with:
+
+```text
+celery -A worker:celery_app worker --loglevel=INFO --concurrency=1 --queues=sam_manual_shadow --without-gossip --without-mingle
+```
+
+From a separate process with the same reviewed private worker environment,
+publish exactly one zero-argument probe with:
+
+```text
+celery -A worker:celery_app call sam_analytics.verify_staging_raw_evidence
+```
+
+Do not supply arguments, a custom task ID, a different queue, or a repeat loop.
+"Manual-only" is an operational boundary, not Celery authentication: keep the
+internal Redis endpoint private and restrict its credential to the approved
+Render services plus the operator process used for this one publish. Anyone
+who can publish to that broker could enqueue work.
+
+Early acknowledgement makes this staging probe at-most-once, not guaranteed
+delivery. A process loss before the first database transaction can leave no
+audit row. A process or database failure later can leave the latest durable
+state at `queued` or `running`; in particular, the fixed object can exist even
+if the final `succeeded` append fails. Treat every such outcome as
+**inconclusive**, inspect the private audit and deterministic object state, and
+then deliberately publish a new task with a new Celery-generated ID if needed.
+Never infer success from the object's presence alone.
+
+These controls bound one deliberate synthetic staging dispatch; they are not a
+complete production provider dispatcher, outbox, reconciliation process, or
+dead-letter system.
+
+## Still not authorized
+
+The private `sam-raw-evidence-staging` and `sam-raw-evidence-prod` R2 buckets
+exist with public access disabled. Both should stay empty until this release is
+merged and the staging token is placed only in a separately approved private
+worker.
+
+Creating a Render Background Worker is a separate paid infrastructure action.
+Confirm the displayed price before creating it. Do not create a Cron Job or
+start Celery Beat.
+
+Real provider ingestion remains blocked until the previously exposed odds key
+is rotated, provider storage/derivation/display/redistribution rights are
+approved, retention and recovery controls are recorded, and a durable per-run
+evidence receipt, idempotent dispatch, crash reconciliation, bounded retry,
+dead-letter, alerting, worker-health, and empty-response behavior are reviewed.

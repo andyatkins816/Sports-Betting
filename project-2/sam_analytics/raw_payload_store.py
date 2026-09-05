@@ -4,7 +4,8 @@ SAM's normalized odds rows are useful only when they can be traced back to the
 exact provider response that produced them. This module supplies the narrow
 contract and deterministic in-memory fake used by the ledger. The concrete
 AWS S3/Cloudflare R2 implementation lives in ``s3_payload_store.py``; it is
-deliberately not constructed by the public API or the current inert worker.
+never constructed by the public API and is admitted by the private worker only
+for the staging synthetic probe.
 
 Raw objects are addressed by the SHA-256 digest of their *unmodified bytes*.
 The returned receipt intentionally never contains the payload itself, request

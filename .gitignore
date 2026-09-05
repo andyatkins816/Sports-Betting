@@ -1,4 +1,5 @@
 .env
+.env.worker
 .venv/
 __pycache__/
 **/__pycache__/

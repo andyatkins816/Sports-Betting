@@ -11,9 +11,9 @@ requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
     "alembic>=1.14,<2",
-    # Used only by the deliberately unwired private raw-evidence adapter.
-    # It supports AWS S3 and Cloudflare R2's S3-compatible API; no web route
-    # constructs that client or receives its credentials.
+    # Used only by the private raw-evidence adapter. The staging worker can
+    # construct it for a fixed synthetic probe; no web route or provider task
+    # constructs the client or receives its credentials.
     "boto3>=1.35,<2",
     "celery[redis]>=5.4,<6",
     "Flask>=3.0,<4",

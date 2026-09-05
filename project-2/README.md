@@ -13,14 +13,17 @@ immutable receipt, provenance, event identity, snapshot, and lineage link in
 one PostgreSQL transaction.
 
 There is intentionally no active provider worker. A concrete private
-AWS S3/Cloudflare R2 raw-evidence adapter is available, but it is not configured
-or wired into the worker yet. Ingestion stays disabled until that private store,
-exact provider-contract/terms version, bounded dispatcher, and operational
-alerts have all been reviewed. Do not add an odds-provider key to the public
-web service.
+Cloudflare R2 raw-evidence adapter is wired only to a manual, staging-only
+synthetic storage probe. The fixed fixture cannot create odds, events, model
+inputs, or public output. Real ingestion stays disabled until the provider
+contract/terms version, retention policy, bounded dispatcher, and operational
+alerts have all been reviewed. Do not add an odds-provider key or worker-only
+configuration to the public web service.
 
-See [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md)
-for the future worker-only configuration and least-privilege requirements.
+See [private worker admission](docs/PRIVATE_WORKER_ADMISSION.md) and
+[private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md) for
+the exact synthetic staging boundary, provider-specific credential limits, and
+compensating retention controls.
 
 The public integration surface is GET /api/v1/integration/status, protected by
 a dedicated status-only credential and limited to a sanitized readiness
