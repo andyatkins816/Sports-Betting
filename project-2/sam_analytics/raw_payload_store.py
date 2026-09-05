@@ -1,11 +1,10 @@
 """Private, content-addressed storage contracts for raw provider payloads.
 
 SAM's normalized odds rows are useful only when they can be traced back to the
-exact provider response that produced them.  This module deliberately does
-not implement a cloud storage client: a production implementation must use a
-private object store selected and configured by the deployment owner.  It does
-provide the narrow contract that implementation must satisfy, plus an
-in-memory fake for deterministic unit tests.
+exact provider response that produced them. This module supplies the narrow
+contract and deterministic in-memory fake used by the ledger. The concrete
+AWS S3/Cloudflare R2 implementation lives in ``s3_payload_store.py``; it is
+deliberately not constructed by the public API or the current inert worker.
 
 Raw objects are addressed by the SHA-256 digest of their *unmodified bytes*.
 The returned receipt intentionally never contains the payload itself, request

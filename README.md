@@ -53,6 +53,7 @@ that compose file as the production secret-management plan.
 - [Audit and remediation status](project-2/docs/AUDIT_2026-09-04.md)
 - [Data, model, backtest, and risk governance](project-2/docs/DATA_AND_MODEL_GOVERNANCE.md)
 - [sam.vegas deployment runbook](project-2/docs/DEPLOYMENT_SAM_VEGAS.md)
+- [Private raw-evidence object storage](project-2/docs/RAW_EVIDENCE_OBJECT_STORAGE.md)
 - [PostgreSQL audit schema](project-2/migrations/001_initial.sql) and
   [provider-receipt lineage migration](project-2/migrations/004_provider_payload_receipts.sql)
 
