@@ -193,6 +193,10 @@ class PrivateWorkerSettingsTests(unittest.TestCase):
             "CELERY_RESULT_BACKEND",
             "CELERY_CONFIG_MODULE",
             "CELERY_LOADER",
+            "CELERY_DUMMY_PROXY",
+            "CELERY_LOG_LEVEL",
+            "CELERY_LOG_REDIRECT",
+            "CELERY_LOG_REDIRECT_LEVEL",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
             "AWS_PROFILE",
@@ -224,6 +228,33 @@ class PrivateWorkerSettingsTests(unittest.TestCase):
                     PrivateWorkerSettings.from_environment(environment)
                 self.assertNotIn(sentinel, str(raised.exception))
                 self.assertIsNone(raised.exception.__context__)
+
+    def test_admits_only_known_celery_worker_runtime_markers(self) -> None:
+        environment = self._environment()
+        environment.update(
+            {
+                "CELERY_LOG_LEVEL": "20",
+                "CELERY_LOG_REDIRECT": "1",
+                "CELERY_LOG_REDIRECT_LEVEL": "WARNING",
+                "celery_dummy_proxy": "set_by_celeryd",
+            }
+        )
+
+        settings = PrivateWorkerSettings.from_environment(environment)
+
+        self.assertEqual(settings.environment, "staging")
+
+        for name in (
+            "CELERY_LOG_LEVEL",
+            "CELERY_LOG_REDIRECT",
+            "CELERY_LOG_REDIRECT_LEVEL",
+            "celery_dummy_proxy",
+        ):
+            with self.subTest(name=name):
+                changed = dict(environment)
+                changed[name] = "operator-supplied"
+                with self.assertRaises(PrivateWorkerConfigurationError):
+                    PrivateWorkerSettings.from_environment(changed)
 
     def test_rejects_new_secret_like_names_without_needing_an_allowlist_update(self) -> None:
         sentinel = "private-sentinel-value"

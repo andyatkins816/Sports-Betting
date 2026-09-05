@@ -39,6 +39,18 @@ _R2_CREDENTIAL_NAMES = (
     "SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY",
 )
 
+# Celery writes these exact operational markers after startup validation and
+# before prefork task execution. Admit only the values produced by the reviewed
+# worker command; user-supplied CELERY_* configuration remains forbidden below.
+_CELERY_RUNTIME_MARKERS = frozenset(
+    {
+        ("CELERY_LOG_LEVEL", "20"),
+        ("CELERY_LOG_REDIRECT", "1"),
+        ("CELERY_LOG_REDIRECT_LEVEL", "WARNING"),
+        ("celery_dummy_proxy", "set_by_celeryd"),
+    }
+)
+
 # Defense in depth for environment groups: the worker may receive only the two
 # explicitly named R2 credentials above.  A newly introduced provider or admin
 # secret must fail admission even before this exact-name list is updated.
@@ -184,6 +196,8 @@ def _reject_forbidden_settings(values: Mapping[str, str]) -> None:
         if not isinstance(name, str) or not _is_configured_value(value):
             continue
         if name in _R2_CREDENTIAL_NAMES:
+            continue
+        if (name, value) in _CELERY_RUNTIME_MARKERS:
             continue
         if (
             name.upper().startswith("PG")
