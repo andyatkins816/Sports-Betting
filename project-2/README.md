@@ -12,10 +12,15 @@ bytes privately before a single normalized quote is committed, then records an
 immutable receipt, provenance, event identity, snapshot, and lineage link in
 one PostgreSQL transaction.
 
-There is intentionally no active provider worker. It stays disabled until a
-private object store, exact provider-contract/terms version, bounded dispatcher,
-and operational alerts have all been configured. Do not add an odds-provider
-key to the public web service.
+There is intentionally no active provider worker. A concrete private
+AWS S3/Cloudflare R2 raw-evidence adapter is available, but it is not configured
+or wired into the worker yet. Ingestion stays disabled until that private store,
+exact provider-contract/terms version, bounded dispatcher, and operational
+alerts have all been reviewed. Do not add an odds-provider key to the public
+web service.
+
+See [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md)
+for the future worker-only configuration and least-privilege requirements.
 
 The public integration surface is GET /api/v1/integration/status, protected by
 a dedicated status-only credential and limited to a sanitized readiness

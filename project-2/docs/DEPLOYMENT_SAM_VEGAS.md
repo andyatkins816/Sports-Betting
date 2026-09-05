@@ -132,8 +132,8 @@ store. A secret belongs in exactly the service that needs it.
 | `ALLOWED_ORIGINS` | Render `sam-api` | Exact public Base44 origins only; never use `*` for an authenticated API. |
 | `DATABASE_URL` | Render `sam-api` and future worker | Use Render's internal Postgres connection string, not an external URL. The current readiness endpoint checks it without revealing it. |
 | `REDIS_URL` | Render `sam-api` and future worker | Use only the private/internal Key Value connection string. The current readiness endpoint checks it without revealing it. |
-| `ODDS_PROVIDER_API_KEY` | Future private worker only | Rotate the previously exposed key first. Never add it to the web API, Base44, browser, GitHub, or logs. |
-| object-storage credentials | Future private worker only | Use a least-privilege service identity limited to SAM's bucket/prefix. |
+| `ODDS_PROVIDER_API_KEY` | Future private worker only | Rotate the previously exposed key first. Never add it to the web API, Base44, browser, GitHub, or logs. Staging/production `sam-api` refuses to start if this or a results-provider key is present. |
+| object-storage credentials | Future private worker only | Use a least-privilege service identity limited to SAM's bucket/prefix. Staging/production `sam-api` refuses to start if either evidence-store access-key value is present. |
 
 Never use a URL query parameter for a secret. Never expose secrets through an
 API response, Base44 entity, client-side JavaScript, logs, screenshots, or an
@@ -168,6 +168,11 @@ AI-agent prompt.
 Use an S3-compatible provider selected for the applicable data-license and
 retention requirements. Store only the data the provider contract permits SAM
 to retain.
+
+The repository now includes a concrete but deliberately unwired AWS S3 /
+Cloudflare R2 adapter. Follow the exact credential, bucket, endpoint, and
+least-privilege requirements in [private raw-evidence object storage](RAW_EVIDENCE_OBJECT_STORAGE.md)
+before a future worker is allowed to construct it.
 
 - Keep the bucket private; block anonymous listing and public object reads.
 - Encrypt data at rest and in transit; enable versioning or write-once evidence
