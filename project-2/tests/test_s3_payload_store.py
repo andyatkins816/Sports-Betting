@@ -12,6 +12,11 @@ from sam_analytics.s3_payload_store import (
     S3CompatibleRawPayloadStore,
     S3RawPayloadStoreConfig,
 )
+from sam_analytics.worker_settings import (
+    SYNTHETIC_STAGING_EVIDENCE_URI,
+    SYNTHETIC_STAGING_MAX_BYTES,
+    PrivateWorkerSettings,
+)
 
 
 class _S3Error(Exception):
@@ -339,23 +344,37 @@ class S3RawPayloadStoreTests(unittest.TestCase):
             captured["secret_access_key"] = secret_access_key
             return client
 
+        environment = {
+            "APP_ENV": "staging",
+            "DATABASE_URL": "postgresql://sam:opaque@dpg-sam-test-a/sam",
+            "REDIS_URL": "redis://red-sam-test:6379/0",
+            "SAM_WORKER_ROLE": "private_ingestion",
+            "SAM_WORKER_MODE": "synthetic_storage_probe",
+            "SAM_INGESTION_ENABLED": "false",
+            "SAM_RAW_EVIDENCE_STORE_BACKEND": "cloudflare_r2",
+            "SAM_RAW_EVIDENCE_STORE_URI": SYNTHETIC_STAGING_EVIDENCE_URI,
+            "SAM_RAW_EVIDENCE_S3_REGION": "auto",
+            "SAM_RAW_EVIDENCE_S3_ENDPOINT_URL": (
+                "https://0123456789abcdef0123456789abcdef.us.r2.cloudflarestorage.com"
+            ),
+            "SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID": "r2-access-key-id",
+            "SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY": "r2-secret-key",
+            "SAM_RAW_EVIDENCE_MAX_BYTES": str(SYNTHETIC_STAGING_MAX_BYTES),
+        }
+        admitted = PrivateWorkerSettings.from_environment(environment)
         store = S3CompatibleRawPayloadStore.from_environment(
-            {
-                "SAM_RAW_EVIDENCE_STORE_BACKEND": "cloudflare_r2",
-                "SAM_RAW_EVIDENCE_STORE_URI": "s3://sam-evidence-private/raw/odds",
-                "SAM_RAW_EVIDENCE_S3_REGION": "auto",
-                "SAM_RAW_EVIDENCE_S3_ENDPOINT_URL": (
-                    "https://0123456789abcdef0123456789abcdef.us.r2.cloudflarestorage.com"
-                ),
-                "SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID": "r2-access-key-id",
-                "SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY": "r2-secret-key",
-                "SAM_RAW_EVIDENCE_MAX_BYTES": "1024",
-            },
+            environment,
             client_factory=factory,
         )
 
-        self.assertEqual(store.config.bucket, "sam-evidence-private")
-        self.assertEqual(store.config.prefix, "raw/odds")
+        self.assertEqual(store.config.bucket, "sam-raw-evidence-staging")
+        self.assertEqual(store.config.prefix, "raw/synthetic")
+        self.assertEqual(store.config.max_payload_bytes, SYNTHETIC_STAGING_MAX_BYTES)
+        self.assertEqual(
+            f"s3://{store.config.bucket}/{store.config.prefix}",
+            admitted.raw_evidence_store_uri,
+        )
+        self.assertEqual(store.config.endpoint_url, admitted.raw_evidence_s3_endpoint_url)
         self.assertEqual(captured["access_key_id"], "r2-access-key-id")
         self.assertEqual(captured["secret_access_key"], "r2-secret-key")
 

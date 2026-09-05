@@ -48,9 +48,9 @@ For a local container stack, copy `.env.example` to `.env`, choose unique local
 secrets, set `POSTGRES_PASSWORD`, and run `docker compose up --build`. The
 default stack starts the migration job, API, PostgreSQL, and Redis only. It does
 not start a provider worker or a scheduler; the worker is an explicit
-`private-worker` profile and remains fail-closed until a separately reviewed
-private-ingestion release is available. Do not use that compose file as the
-production secret-management plan.
+`private-worker` profile. It admits only the reviewed, manual synthetic probe
+against the staging evidence bucket; real provider tasks remain fail-closed.
+Do not use that compose file as the production secret-management plan.
 
 ## Documentation
 

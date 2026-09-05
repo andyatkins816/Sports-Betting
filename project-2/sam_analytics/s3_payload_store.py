@@ -4,16 +4,19 @@ The raw-payload ledger needs an object store that is private by construction,
 uses conditional creates rather than overwrite requests, and never turns an
 object location into a public or presigned URL. This module implements that
 boundary for either AWS S3 or Cloudflare R2. It deliberately has no scheduler,
-provider client, or Flask route; a future *private* worker must opt in to
-constructing this store. Provider-administered WORM/retention controls remain
+provider client, or Flask route; only the separately admitted *private* worker
+may construct this store. Provider-administered WORM/retention controls remain
 an operational requirement.
 
 Only ``PutObject``, ``HeadObject``, and a bounded ``GetObject`` integrity read
-are used. The intended credentials must be scoped to the configured bucket and
-prefix, and must not permit public ACLs, listing, deletion, or access to
-unrelated objects. The object-store service identity, bucket policy, and
-public-access settings are operational controls that cannot safely be inferred
-from an application's credentials alone.
+are used. Credentials must be restricted as tightly as the selected provider
+supports and must never authorize unrelated buckets or public access. AWS IAM
+can omit listing and deletion entirely; Cloudflare R2's standard bucket-scoped
+Object Read & Write token is broader than the calls this adapter makes and
+should be assumed able to list, copy, and delete objects. A time-limited token
+when available, immediate revocation, and a provider-enforced prefix retention
+rule are therefore operational controls. Credential and bucket policy cannot
+safely be inferred from an application's credentials alone.
 """
 
 from __future__ import annotations
@@ -93,7 +96,7 @@ S3ClientFactory = Callable[
 class S3RawPayloadStoreConfig:
     """Non-secret configuration for a private AWS S3 or Cloudflare R2 store.
 
-    The future Render worker must receive a scoped S3 access-key pair for
+    A private Render worker must receive a scoped S3 access-key pair for
     either backend. The adapter intentionally never falls back to ambient SDK
     credentials, which avoids a developer-machine credential chain becoming a
     surprise deployment dependency. Credentials deliberately do not live on
@@ -132,7 +135,7 @@ class S3RawPayloadStoreConfig:
     def from_environment(
         cls, environ: Mapping[str, str] | None = None
     ) -> "S3RawPayloadStoreConfig":
-        """Read only non-secret S3/R2 configuration from a future worker env."""
+        """Read only non-secret S3/R2 configuration from a private worker env."""
 
         values = os.environ if environ is None else environ
         backend = _required_config_value(values, "SAM_RAW_EVIDENCE_STORE_BACKEND")
@@ -187,12 +190,11 @@ class S3CompatibleRawPayloadStore:
         *,
         client_factory: S3ClientFactory | None = None,
     ) -> "S3CompatibleRawPayloadStore":
-        """Build a private store for a future worker without exposing secrets.
+        """Build a private store for an admitted worker without exposing secrets.
 
-        This method is intentionally not called by the web process or the
-        current inert worker.  It exists so that a reviewed future worker can
-        construct the concrete store only after the bucket and scoped service
-        credentials have been provisioned.
+        This method is intentionally never called by the web process. The
+        private worker may call it only after its exact staging admission has
+        been revalidated and scoped service credentials have been provisioned.
         """
 
         values = os.environ if environ is None else environ

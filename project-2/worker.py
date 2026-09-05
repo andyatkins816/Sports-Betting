@@ -1,185 +1,48 @@
-"""Fail-closed Celery entry point for future isolated ingestion jobs.
+"""Fail-closed Celery entry point for one synthetic staging storage probe.
 
-This module intentionally has no provider client import and no periodic task
-schedule.  It may only start after an operator has declared a *private* worker
-role and a private, secret-free raw-evidence object-store prefix. It still
-does not implement a provider request: that requires a reviewed integration
-with the evidence store, provider contract, and bounded dispatcher.
-
-Web/API, provider, and object-store credentials are deliberately rejected by
-this placeholder entry point. Keeping credentials out of an inert worker
-prevents a future config change from accidentally making a live request before
-the complete evidence path exists.
+The worker is private, manual-only, and intentionally incapable of contacting
+an odds or results provider. Its sole admitted operation writes deterministic
+synthetic bytes through the reviewed R2 adapter and records an append-only
+PostgreSQL lifecycle. The real ingestion and settlement task names remain
+registered only so an accidental dispatch fails visibly.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Mapping
-from urllib.parse import urlsplit
+from uuid import UUID
 
 from celery import Celery
+from kombu import Queue
+
+from sam_analytics.ingestion_run_repository import PostgresIngestionRunRepository
+from sam_analytics.s3_payload_store import S3CompatibleRawPayloadStore
+from sam_analytics.synthetic_evidence_probe import SyntheticEvidenceProbe
+from sam_analytics.worker_settings import (
+    PrivateWorkerConfigurationError,
+    PrivateWorkerSettings,
+)
 
 
-class WorkerConfigurationError(RuntimeError):
-    """Raised without exposing connection strings or provider credentials."""
+WorkerConfigurationError = PrivateWorkerConfigurationError
 
 
 class IngestionNotImplementedError(RuntimeError):
-    """Raised when someone attempts to execute an intentionally inert task."""
+    """Raised when an intentionally inert provider task is dispatched."""
 
 
-_PRIVATE_WORKER_ROLE = "private_ingestion"
-# The concrete immutable-store boundary currently supports AWS S3 and
-# Cloudflare R2 through the S3-compatible ``s3://`` object-reference form.
-_PRIVATE_EVIDENCE_STORE_SCHEMES = frozenset({"s3"})
-# These shapes intentionally match the durable object-reference contract in
-# ``raw_payload_store``.  A configured prefix must be able to become a valid
-# content-addressed receipt URI once the store is wired into a worker.
-_PRIVATE_OBJECT_NAMESPACE_RE = re.compile(
-    r"^[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])$"
-)
-_PRIVATE_OBJECT_PATH_PART_RE = re.compile(r"^[a-z0-9][a-z0-9._=-]{0,63}$")
-_IPV4_LIKE_NAMESPACE_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
-_INERT_WORKER_FORBIDDEN_SECRET_NAMES = (
-    "SESSION_SECRET",
-    "SAM_API_KEY",
-    "SAM_STATUS_API_KEY",
-    "ODDS_PROVIDER_API_KEY",
-    "RESULTS_PROVIDER_API_KEY",
-    "SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID",
-    "SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY",
-)
-
-
-def _required_url(
-    name: str,
-    allowed_schemes: frozenset[str],
-    environ: Mapping[str, str],
-) -> str:
-    """Return a required service URL after a credential-safe structural check."""
-
-    value = environ.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise WorkerConfigurationError(f"{name} must be configured before the worker can start")
-    value = value.strip()
-    try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-    except ValueError:
-        raise WorkerConfigurationError(f"{name} must be a valid service URL") from None
-    if parsed.scheme not in allowed_schemes or not hostname:
-        raise WorkerConfigurationError(f"{name} must be a valid service URL")
-    return value
-
-
-def _required_private_evidence_store_uri(environ: Mapping[str, str]) -> None:
-    """Require a secret-free private object-store prefix for a worker.
-
-    This verifies only the deployment contract, not a cloud-provider policy:
-    operators must still block public access and grant this worker the minimum
-    bucket/prefix permissions. A concrete storage adapter exists separately,
-    but is intentionally not wired into this inert worker yet.
-    """
-
-    value = environ.get("SAM_RAW_EVIDENCE_STORE_URI")
-    if not isinstance(value, str) or not value.strip():
-        raise WorkerConfigurationError(
-            "SAM_RAW_EVIDENCE_STORE_URI must be configured before the worker can start"
-        )
-    try:
-        parsed = urlsplit(value.strip())
-        port = parsed.port
-    except ValueError:
-        raise WorkerConfigurationError(
-            "SAM_RAW_EVIDENCE_STORE_URI must be a valid private URI"
-        ) from None
-
-    raw_path_parts = tuple(parsed.path.split("/"))
-    path_parts = tuple(part for part in raw_path_parts if part)
-    namespace = parsed.hostname
-    if (
-        parsed.scheme not in _PRIVATE_EVIDENCE_STORE_SCHEMES
-        or not namespace
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.query
-        or parsed.fragment
-        or not path_parts
-        or any(not part for part in raw_path_parts[1:])
-        or any(part in {".", "..", "sha256"} for part in path_parts)
-        or not _PRIVATE_OBJECT_NAMESPACE_RE.fullmatch(namespace)
-        or ".." in namespace
-        or ".-" in namespace
-        or "-." in namespace
-        or _IPV4_LIKE_NAMESPACE_RE.fullmatch(namespace)
-        or namespace.startswith("xn--")
-        or not all(_PRIVATE_OBJECT_PATH_PART_RE.fullmatch(part) for part in path_parts)
-    ):
-        raise WorkerConfigurationError(
-            "SAM_RAW_EVIDENCE_STORE_URI must be a valid private URI"
-        )
-
-
-def _require_private_worker_role(environ: Mapping[str, str]) -> None:
-    """Reject a worker that was not explicitly designated private."""
-
-    value = environ.get("SAM_WORKER_ROLE", "")
-    if not isinstance(value, str) or value.strip() != _PRIVATE_WORKER_ROLE:
-        raise WorkerConfigurationError(
-            "SAM_WORKER_ROLE must be private_ingestion before the worker can start"
-        )
-
-
-def _reject_inert_worker_secrets(environ: Mapping[str, str]) -> None:
-    """Do not let a currently inert worker accumulate usable credentials."""
-
-    if any(
-        isinstance(environ.get(name), str) and environ[name].strip()
-        for name in _INERT_WORKER_FORBIDDEN_SECRET_NAMES
-    ):
-        raise WorkerConfigurationError(
-            "web, provider, or object-store credentials cannot be configured "
-            "until audited ingestion is implemented"
-        )
-
-
-def _validate_private_worker_admission(environ: Mapping[str, str]) -> str:
-    """Validate the minimum safe boundary for launching the worker process.
-
-    The returned broker URL is used only to configure Celery.  Provider keys
-    are neither read nor accepted here.  This boundary intentionally requires
-    an object-store *prefix* before the process can run, but it makes no
-    network call and cannot prove a bucket policy by itself.
-    """
-
-    _require_private_worker_role(environ)
-    _required_url("DATABASE_URL", frozenset({"postgresql", "postgres"}), environ)
-    redis_url = _required_url("REDIS_URL", frozenset({"redis", "rediss"}), environ)
-    _required_private_evidence_store_uri(environ)
-    _reject_inert_worker_secrets(environ)
-    if ingestion_enabled(environ):
-        raise WorkerConfigurationError(
-            "SAM_INGESTION_ENABLED cannot be true until audited ingestion is implemented"
-        )
-    return redis_url
+_MANUAL_SHADOW_QUEUE = "sam_manual_shadow"
+_SYNTHETIC_PROBE_TASK = "sam_analytics.verify_staging_raw_evidence"
 
 
 def create_celery_app(environ: Mapping[str, str] | None = None) -> Celery:
-    """Build a worker app only when its private dependencies are configured.
-
-    This entry point will not run as a generic worker or a public web process.
-    It needs an explicit private worker role, internal database/broker URLs,
-    and a private object-store prefix even though its task is still inert.
-    Celery result storage is disabled so task return values cannot fill the
-    shared, ``noeviction`` Valkey instance.
-    """
+    """Build the worker only inside the exact synthetic staging boundary."""
 
     source = os.environ if environ is None else environ
-    redis_url = _validate_private_worker_admission(source)
-    app = Celery("sam_analytics", broker=redis_url, backend="disabled://")
+    PrivateWorkerSettings.from_environment(source)
+    broker_url = source["REDIS_URL"]
+    app = Celery("sam_analytics", broker=broker_url, backend="disabled://")
     app.conf.update(
         task_serializer="json",
         accept_content=["json"],
@@ -188,34 +51,40 @@ def create_celery_app(environ: Mapping[str, str] | None = None) -> Celery:
         task_ignore_result=True,
         task_store_errors_even_if_ignored=False,
         task_track_started=False,
-        task_acks_late=True,
-        task_reject_on_worker_lost=True,
+        # One deliberate dispatch must never become an automatic retry or a
+        # worker-lost redelivery. A human may inspect the append-only outcome
+        # before choosing whether to dispatch a new task.
+        task_acks_late=False,
+        task_reject_on_worker_lost=False,
         worker_prefetch_multiplier=1,
+        worker_concurrency=1,
         task_soft_time_limit=75,
         task_time_limit=90,
-        task_default_queue="sam_ingestion",
+        task_default_queue=_MANUAL_SHADOW_QUEUE,
+        task_queues=(Queue(_MANUAL_SHADOW_QUEUE),),
+        task_create_missing_queues=False,
         task_routes={
-            "sam_analytics.ingest_quotes": {"queue": "sam_ingestion"},
-            "sam_analytics.settle_events": {"queue": "sam_ingestion"},
+            _SYNTHETIC_PROBE_TASK: {"queue": _MANUAL_SHADOW_QUEUE},
+            # Known-but-disabled task names use the consumed queue so an
+            # accidental dispatch fails visibly instead of accumulating in an
+            # unconsumed Redis list.
+            "sam_analytics.ingest_quotes": {"queue": _MANUAL_SHADOW_QUEUE},
+            "sam_analytics.settle_events": {"queue": _MANUAL_SHADOW_QUEUE},
         },
         task_send_sent_event=False,
         worker_send_task_events=False,
         worker_enable_remote_control=False,
-        # An explicit empty mapping prevents Celery Beat from autonomously
-        # polling a provider.  A later audited dispatcher may enqueue bounded
-        # work only after a human deliberately enables it.
         beat_schedule={},
     )
     return app
 
 
 def ingestion_enabled(environ: Mapping[str, str] | None = None) -> bool:
-    """Return true only for an explicit operator opt-in.
+    """Return true only for an explicit operator switch.
 
-    Anything other than the literal word ``true`` is disabled, including a
-    missing variable, an accidental provider key, or a copied development
-    configuration.  Enabling this flag alone still does not authorize network
-    calls; the task remains intentionally unimplemented below.
+    The admitted worker configuration rejects this value, so it cannot make a
+    provider request. Keeping the parser separate makes the inert task's
+    failure behavior explicit and testable.
     """
 
     source = os.environ if environ is None else environ
@@ -223,20 +92,70 @@ def ingestion_enabled(environ: Mapping[str, str] | None = None) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _celery_job_identity(task_id: object) -> str:
+    """Convert only a canonical Celery UUID into a safe audit identity."""
+
+    if not isinstance(task_id, str):
+        raise WorkerConfigurationError("the manual probe task identity is invalid")
+    parsed: UUID | None = None
+    parse_failed = False
+    try:
+        parsed = UUID(task_id)
+    except (AttributeError, TypeError, ValueError):
+        parse_failed = True
+    if parse_failed or parsed is None or str(parsed) != task_id.lower():
+        raise WorkerConfigurationError("the manual probe task identity is invalid")
+    return f"celery:{parsed}"
+
+
+def _execute_synthetic_storage_probe(
+    *,
+    task_id: object,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Revalidate admission and execute the injected synthetic probe once."""
+
+    source = os.environ if environ is None else environ
+    PrivateWorkerSettings.from_environment(source)
+    job_identity = _celery_job_identity(task_id)
+    raw_payload_store = S3CompatibleRawPayloadStore.from_environment(source)
+    ingestion_run_repository = PostgresIngestionRunRepository(source["DATABASE_URL"])
+    probe = SyntheticEvidenceProbe(
+        raw_payload_store=raw_payload_store,
+        ingestion_run_repository=ingestion_run_repository,
+    )
+    # Deliberately discard the internal receipt summary. Celery result storage
+    # is disabled and the task returns no digest, object reference, or bytes.
+    probe.run(job_identity=job_identity)
+
+
 celery_app = create_celery_app()
 
 
-@celery_app.task(name="sam_analytics.ingest_quotes")
-def ingest_quotes() -> None:
-    """Deliberately inert queue hook for a future licensed provider adapter.
+@celery_app.task(
+    bind=True,
+    name=_SYNTHETIC_PROBE_TASK,
+    queue=_MANUAL_SHADOW_QUEUE,
+    ignore_result=True,
+    acks_late=False,
+    reject_on_worker_lost=False,
+    max_retries=0,
+)
+def verify_staging_raw_evidence(task) -> None:
+    """Manually verify fixed synthetic bytes against staging R2 and audit."""
 
-    This task does not import an adapter, issue HTTP requests, or write to
-    PostgreSQL.  It exists only to make the disabled/explicit-enabled boundary
-    testable before the complete payload-receipt ledger is wired in.
-    """
-    # This is intentionally an error rather than a successful no-op. An
-    # accidental dispatcher should be observable as blocked, never mistaken
-    # for a completed provider pull. No provider module is imported first.
+    _execute_synthetic_storage_probe(task_id=task.request.id)
+
+
+@celery_app.task(
+    name="sam_analytics.ingest_quotes",
+    queue=_MANUAL_SHADOW_QUEUE,
+    ignore_result=True,
+    max_retries=0,
+)
+def ingest_quotes() -> None:
+    """Fail closed; licensed provider ingestion is not implemented."""
+
     if not ingestion_enabled():
         raise IngestionNotImplementedError(
             "SAM_INGESTION_ENABLED is false; no provider request was made"
@@ -246,9 +165,15 @@ def ingest_quotes() -> None:
     )
 
 
-@celery_app.task(name="sam_analytics.settle_events")
+@celery_app.task(
+    name="sam_analytics.settle_events",
+    queue=_MANUAL_SHADOW_QUEUE,
+    ignore_result=True,
+    max_retries=0,
+)
 def settle_events() -> None:
-    """Deliberately inert hook for a future licensed results provider."""
+    """Fail closed; licensed results ingestion is not implemented."""
+
     raise IngestionNotImplementedError(
         "results ingestion is not implemented; no provider request was made"
     )

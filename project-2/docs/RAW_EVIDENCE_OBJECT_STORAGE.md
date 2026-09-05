@@ -1,23 +1,28 @@
 # Private raw-evidence object storage
 
 This document describes the storage boundary that must exist **before** SAM
-accepts licensed provider responses. It is intentionally not a deployment
-instruction for today: the current `sam-api` web service and inert worker do
-not construct this adapter, and neither should receive object-store or odds
-provider credentials.
+accepts licensed provider responses. The public `sam-api` web service never
+constructs this adapter and must not receive object-store or odds-provider
+credentials. The private worker can construct it only in the exact
+staging-only synthetic probe mode described below.
 
-An operator may provision an empty, private evidence bucket in advance. That
-is only an infrastructure prerequisite, not approval to create a storage API
-token, deploy a worker, or make a provider request. Create the scoped token
-only after a separately reviewed private-worker implementation release has
-been merged, so it can be placed immediately in that worker's private secret
-store.
+The private R2 buckets `sam-raw-evidence-staging` and
+`sam-raw-evidence-prod` are provisioned with Standard storage and public
+access disabled. That is only an infrastructure prerequisite, not approval to
+make a provider request. Create a staging-bucket-scoped token only after this
+private-worker release has been reviewed and merged, so it can be placed
+immediately in that worker's private secret store. Keep the production bucket
+empty and credential-free during this staging check. Before creating the token,
+add a seven-day R2 bucket-lock rule for the `raw/synthetic/` prefix in the
+staging bucket; that provider-enforced rule prevents the probe object from
+being overwritten or deleted during the review window.
 
 `sam_analytics.s3_payload_store.S3CompatibleRawPayloadStore` is a concrete
 S3-compatible implementation of the `RawPayloadStore` contract. It supports
 AWS S3 and Cloudflare R2, but it has no public URL, polling loop, Flask route,
-or scheduler. A later reviewed change must wire it into `OddsLedger` inside a
-private background worker.
+or scheduler. This release wires it only to a fixed synthetic storage probe;
+a later reviewed change must separately wire licensed provider evidence into
+`OddsLedger` inside a private background worker.
 
 ## What the adapter guarantees
 
@@ -54,21 +59,30 @@ header, while R2 encrypts objects at rest automatically; SAM therefore omits
 that unsupported header for R2. See [R2 S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
 and [R2 data security](https://developers.cloudflare.com/r2/reference/data-security/).
 
-## Configuration contract for a future private worker
+## Configuration contract for the synthetic staging probe
 
-All of these settings belong only to the future Render Background Worker. The
-current worker rejects the credentials below because provider ingestion is not
-implemented yet. The public `sam-api`, Base44, browser code, GitHub Actions,
-and GoDaddy must never receive them.
+Real deployment values for these settings belong only to the future Render
+Background Worker. The public `sam-api`, Base44, browser code, and GoDaddy must
+never receive them. GitHub Actions may use deliberate non-secret placeholders
+only to prove that the worker container starts; CI must never receive real R2,
+database, or Redis credentials. The worker admits R2 credentials only when
+every other value matches this exact synthetic staging boundary.
 
-| Setting | AWS S3 | Cloudflare R2 |
-| --- | --- | --- |
-| `SAM_RAW_EVIDENCE_STORE_URI` | `s3://bucket/raw/odds` | Same stable, secret-free form |
-| `SAM_RAW_EVIDENCE_STORE_BACKEND` | `aws_s3` | `cloudflare_r2` |
-| `SAM_RAW_EVIDENCE_S3_REGION` | Required AWS region such as `us-west-2` | Exactly `auto` |
-| `SAM_RAW_EVIDENCE_S3_ENDPOINT_URL` | Leave blank for AWS's SDK endpoint, or use the matching AWS regional endpoint | Required: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`; supported jurisdiction forms are `.eu`, `.us`, and `.fedramp` |
-| `SAM_RAW_EVIDENCE_MAX_BYTES` | Max one raw response; defaults to `20971520` (20 MiB), hard limit 100 MiB | Same |
-| `SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID` / `SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY` | Required narrowly scoped AWS key pair, stored only in the Render worker secret group | Required bucket-scoped R2 S3 API token pair |
+The worker also checks that database and broker URLs use Render's documented
+single-label private host forms. Public Render URLs and arbitrary internet
+hosts are rejected; explicit loopback and Compose aliases remain available for
+isolated CI/local verification.
+
+| Setting | Exact value for this release |
+| --- | --- |
+| `APP_ENV` | `staging` |
+| `SAM_WORKER_ROLE` / `SAM_WORKER_MODE` | `private_ingestion` / `synthetic_storage_probe` |
+| `SAM_RAW_EVIDENCE_STORE_URI` | `s3://sam-raw-evidence-staging/raw/synthetic` |
+| `SAM_RAW_EVIDENCE_STORE_BACKEND` | `cloudflare_r2` |
+| `SAM_RAW_EVIDENCE_S3_REGION` | `auto` |
+| `SAM_RAW_EVIDENCE_S3_ENDPOINT_URL` | Required: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`; supported jurisdiction forms are `.eu`, `.us`, and `.fedramp` |
+| `SAM_RAW_EVIDENCE_MAX_BYTES` | `1048576` (1 MiB) |
+| `SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID` / `SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY` | Required Object Read & Write R2 token pair scoped only to `sam-raw-evidence-staging`; choose a time-limited TTL if offered and revoke immediately after the probe |
 
 The URI is a stable identifier, not a connection URL. It must be lowercase
 `s3://`, contain a valid bucket and non-empty safe prefix, and cannot contain a
@@ -94,17 +108,20 @@ in the selected storage provider:
 3. Require HTTPS to the provider's API endpoint. Do not use a URL with an
    embedded access key, secret, query parameter, or presigned signature.
 4. Enable AWS S3 bucket versioning and, where allowed by the provider contract,
-   an appropriate retention/write-once control. R2 has different lifecycle and
-   object-lock capabilities, so confirm the current R2 controls and the data
-   license before promising immutability beyond SAM's conditional-write rule.
+   an appropriate retention/write-once control. For this R2 staging probe, add
+   a seven-day bucket-lock rule limited to `raw/synthetic/` before creating the
+   token. Cloudflare documents that bucket locks prevent deletion and overwrite
+   for their retention period. Revisit the duration and provider agreement
+   before any licensed payload is stored.
 5. Set a lifecycle/retention policy approved by the provider agreement. Raw
    licensed data may not be retained or redistributed indefinitely merely
    because the storage platform permits it.
 6. Store a restore and access-revocation procedure with the deployment record.
 
-The code cannot safely prove bucket privacy without granting broad
-bucket-administration permissions, so privacy is intentionally an operator
-precondition rather than a runtime "check." This preserves least privilege.
+The code cannot safely prove bucket privacy or retention configuration without
+granting bucket-administration permissions, so both are intentionally operator
+preconditions rather than runtime "checks." This keeps administration authority
+out of the application credential.
 
 ### Application verification is not provider-level WORM retention
 
@@ -118,13 +135,15 @@ process. Bucket versioning, Object Lock or an equivalent retention policy, and
 explicit denial of delete/overwrite operations remain operator responsibilities
 subject to the data-provider agreement.
 
-## Least-privilege identity
+## Provider-specific credential boundary
 
-The worker needs only write and full-object read access to its own prefix. The
-read is necessary because verification streams the retained raw bytes and
-SHA-256 hashes them; it is not merely a metadata lookup. It does **not** need
-bucket listing, deletion, ACL changes, bucket-policy changes, or public URL
-permissions.
+The application code needs only write and full-object read access to its own
+prefix. The read is necessary because verification streams the retained raw
+bytes and SHA-256 hashes them; it is not merely a metadata lookup. The adapter
+does not call bucket listing, deletion, ACL, bucket-policy, or public-URL APIs.
+The identity that a provider can issue may nevertheless bundle broader
+permissions, so granted authority must be assessed separately from calls the
+code makes.
 
 For a conventional AWS S3 bucket, the object portion of an IAM policy should
 be restricted to the exact prefix, conceptually:
@@ -145,25 +164,51 @@ Render worker must receive a dedicated AWS access-key pair in its secret group;
 the adapter intentionally does not fall back to a developer machine's ambient
 AWS credential chain.
 
-For R2, create an S3 API token with **Object Read & Write** limited to the
-single evidence bucket. The read permission supports the full-byte SHA-256
-verification above. R2's token interface scopes to buckets; keep the bucket
-dedicated to SAM raw evidence so that its full raw-data read scope remains
-narrow.
+For R2, the dashboard's standard **Object Read & Write** token grants read,
+write, and list access to selected buckets. That is broader than this adapter,
+which never lists, copies, or deletes. Cloudflare's S3 operation mapping places
+copy and deletion in the write category, so assume the issued identity can do
+all three. Restrict it to `sam-raw-evidence-staging` only, never include
+`sam-raw-evidence-prod`, choose a time-limited TTL if the dashboard offers one,
+place it only in the private worker, and revoke it immediately after the single
+manual probe. The seven-day `raw/synthetic/` bucket-lock rule is the
+provider-enforced safeguard against overwrite or deletion during the review
+window. These controls are acceptable only for the fixed synthetic staging
+fixture; they do not approve this credential shape for licensed provider data.
+
+Cloudflare documents the standard token's bundled object permissions in
+[R2 authentication](https://developers.cloudflare.com/r2/api/tokens/), the
+write-operation mapping in [R2 temporary credentials](https://developers.cloudflare.com/r2/api/s3/temporary-credentials/),
+and the retention behavior in [R2 bucket locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/).
+
+The first staging probe uses only the pinned 61-byte synthetic fixture whose
+SHA-256 is
+`5dc961d33ef2a18a1e47b6ffc52475bf0442bf7ba3959787a4718e5fd5015aa1`.
+Its object write and terminal PostgreSQL audit append are separate operations.
+If the object exists while the latest audit fact is still `running`, the probe
+is inconclusive and must be reviewed manually; object presence alone is not a
+successful audit receipt. A durable per-run receipt/outbox and crash
+reconciliation remain mandatory before storing provider data.
 
 ## Not yet authorized
 
-Do not create a Render Background Worker, add a provider credential, or put
-object-store credentials in Render today solely because this code exists. The
-next implementation checkpoint must first review:
+Do not create a paid Render Background Worker until its displayed price is
+confirmed. After this release is reviewed and merged, a staging-only R2 token
+may be created for the one manual synthetic probe, but only after the staging
+prefix's seven-day bucket-lock rule is visible in R2. It must never be placed
+in `sam-api`, Base44, GitHub, a URL, or a screenshot, and it must be revoked
+immediately after the probe is verified.
+
+Do not add a provider credential or run real ingestion. That later checkpoint
+must first review:
 
 - the storage provider's current retention/security settings;
 - the licensed odds provider's storage, derivation, display, and
   redistribution rights;
 - a bounded dispatcher, retry/dead-letter plan, alerts, and a worker health
   signal; and
-- an integration test against a non-production private bucket with synthetic
-  bytes only.
+- a successful manual integration test against the non-production private
+  bucket with synthetic bytes only.
 
 Only after that review should the replacement Odds API credential be stored in
 the private worker's secret group. It must remain absent from `sam-api`, Base44
