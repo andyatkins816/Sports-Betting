@@ -184,7 +184,10 @@ class WorkerTests(unittest.TestCase):
             with self.subTest(unsafe_id=unsafe_id):
                 with self.assertRaises(worker.WorkerConfigurationError) as caught:
                     worker._celery_job_identity(unsafe_id)
-                self.assertNotIn(str(unsafe_id), str(caught.exception))
+                self.assertEqual(
+                    str(caught.exception),
+                    "the manual probe task identity is invalid",
+                )
 
     def test_provider_tasks_remain_inert_without_making_a_network_request(self) -> None:
         worker = self._load_worker(self._environment())
