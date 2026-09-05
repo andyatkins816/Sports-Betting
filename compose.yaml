@@ -25,21 +25,15 @@ services:
   worker:
     build: ./project-2
     command: celery -A worker.celery_app worker --loglevel=INFO
+    # This is intentionally opt-in.  The current worker fails closed until a
+    # separately reviewed private-ingestion release is available.
+    profiles: ["private-worker"]
     env_file: .env
     depends_on:
       migrate:
         condition: service_completed_successfully
-      redis:
+      postgres:
         condition: service_healthy
-    restart: unless-stopped
-
-  scheduler:
-    build: ./project-2
-    command: celery -A worker.celery_app beat --loglevel=INFO
-    env_file: .env
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
       redis:
         condition: service_healthy
     restart: unless-stopped

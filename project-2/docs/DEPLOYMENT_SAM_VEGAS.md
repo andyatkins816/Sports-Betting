@@ -16,7 +16,8 @@ This is the current staging snapshot, checked 2026-09-04:
 | Application environment | `APP_ENV=staging`. | Render's visible project grouping named “Production” is a UI label, not permission to treat SAM as production. |
 | `sam.vegas` | Base44 is the public experience and evidence/governance UI. | Do not point the apex domain at the Python API. |
 | `api.sam.vegas` | Reserved for the Render API custom domain. | Do not configure DNS or Base44's production status URL until Render domain validation is ready. |
-| Worker, scheduler, object storage, odds/results ingestion | Not live. | No Odds API polling, model training, or prediction delivery is authorized yet. |
+| Raw evidence storage | Private Cloudflare R2 bucket `sam-raw-evidence-prod` is provisioned with Standard storage and public access disabled. | It is intentionally empty: no R2 API token, worker, or provider credential has been created yet. It remains unused while SAM is staging; a separate staging bucket is required for synthetic integration testing. |
+| Worker, scheduler, odds/results ingestion | Not live. | No Odds API polling, model training, or prediction delivery is authorized yet. |
 
 The desired topology is deliberately simple:
 
@@ -170,11 +171,16 @@ retention requirements. Store only the data the provider contract permits SAM
 to retain.
 
 The repository now includes a concrete but deliberately unwired AWS S3 /
-Cloudflare R2 adapter. Follow the exact credential, bucket, endpoint, and
-least-privilege requirements in [private raw-evidence object storage](RAW_EVIDENCE_OBJECT_STORAGE.md)
-before a future worker is allowed to construct it.
+Cloudflare R2 adapter. The dedicated R2 bucket is provisioned, but that is not
+authorization to create an API token or worker yet. Follow the exact
+credential, bucket, endpoint, and least-privilege requirements in [private
+raw-evidence object storage](RAW_EVIDENCE_OBJECT_STORAGE.md) before a future
+worker is allowed to construct it.
 
 - Keep the bucket private; block anonymous listing and public object reads.
+- Leave `sam-raw-evidence-prod` empty while the application is staging. After
+  the worker release is reviewed, create a separate non-production bucket for
+  synthetic integration evidence before any production credential is created.
 - Encrypt data at rest and in transit; enable versioning or write-once evidence
   controls where available.
 - Separate raw provider payloads, model artifacts, and reports by restricted

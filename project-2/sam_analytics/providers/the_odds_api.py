@@ -22,6 +22,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from sam_analytics.ingestion import RawOddsQuote
 
 
+_DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+_MAX_RESPONSE_BYTES_HARD_LIMIT = 100 * 1024 * 1024
+_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+
+
 class TheOddsApiError(RuntimeError):
     """A provider failure safe to log without exposing an API key or URL."""
 
@@ -76,12 +81,25 @@ class TheOddsApiClient:
     expected_host = "api.the-odds-api.com"
     supported_featured_markets = frozenset({"h2h", "spreads", "totals"})
 
-    def __init__(self, api_key: str, *, timeout_seconds: float = 10.0):
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout_seconds: float = 10.0,
+        max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
+    ):
         if not api_key or not api_key.strip():
             raise ValueError("The Odds API key is required")
+        if isinstance(max_response_bytes, bool) or not isinstance(max_response_bytes, int):
+            raise ValueError("max_response_bytes must be a positive integer")
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be a positive integer")
+        if max_response_bytes > _MAX_RESPONSE_BYTES_HARD_LIMIT:
+            raise ValueError("max_response_bytes exceeds the allowed maximum")
         _validate_provider_base_url(self.base_url, self.expected_host)
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
+        self._max_response_bytes = max_response_bytes
 
     def fetch_pregame_odds(
         self,
@@ -223,14 +241,16 @@ class TheOddsApiClient:
             with opener.open(request, timeout=self._timeout_seconds) as response:
                 if response.status != 200:
                     raise TheOddsApiError(f"The Odds API returned HTTP {response.status}")
-                raw_payload = response.read()
-                if not isinstance(raw_payload, bytes):
-                    raise TheOddsApiError("The Odds API returned a non-binary response body")
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                raw_payload = _read_bounded_response(
+                    response,
+                    headers=headers,
+                    max_response_bytes=self._max_response_bytes,
+                )
                 received_at = _utc_now()
                 if not _is_aware_datetime(received_at):
                     raise TheOddsApiError("local receipt clock is missing timezone")
                 received_at = received_at.astimezone(timezone.utc)
-                headers = {key.lower(): value for key, value in response.headers.items()}
             try:
                 return _OddsApiResponse(
                     payload=json.loads(raw_payload),
@@ -280,6 +300,47 @@ def _validate_provider_request_url(value: str, expected_host: str) -> None:
         or parsed.fragment
     ):
         raise TheOddsApiError("The Odds API request is not directed to the approved HTTPS host")
+
+
+def _read_bounded_response(
+    response: Any,
+    *,
+    headers: Mapping[str, str],
+    max_response_bytes: int,
+) -> bytes:
+    """Read a provider body without trusting its optional Content-Length header."""
+
+    declared_size = _header_int(headers, "content-length")
+    if declared_size is not None and declared_size > max_response_bytes:
+        raise TheOddsApiError("The Odds API response body exceeds the allowed size")
+
+    try:
+        read = getattr(response, "read", None)
+    except Exception:
+        raise TheOddsApiError("The Odds API response body could not be read") from None
+    if not callable(read):
+        raise TheOddsApiError("The Odds API returned a non-binary response body")
+
+    chunks: list[bytes] = []
+    received = 0
+    while True:
+        # Request at most one extra byte after the current total.  This makes
+        # an omitted, malformed, or underestimated Content-Length harmless.
+        read_size = min(_RESPONSE_READ_CHUNK_BYTES, max_response_bytes - received + 1)
+        try:
+            chunk = read(read_size)
+        except Exception:
+            raise TheOddsApiError("The Odds API response body could not be read") from None
+        if not isinstance(chunk, bytes):
+            raise TheOddsApiError("The Odds API returned a non-binary response body")
+        if not chunk:
+            if declared_size is not None and received != declared_size:
+                raise TheOddsApiError("The Odds API response body length did not match Content-Length")
+            return b"".join(chunks)
+        if len(chunk) > max_response_bytes - received:
+            raise TheOddsApiError("The Odds API response body exceeds the allowed size")
+        chunks.append(chunk)
+        received += len(chunk)
 
 
 def _required_text(data: Mapping[str, Any], key: str) -> str:
