@@ -6,6 +6,13 @@ instruction for today: the current `sam-api` web service and inert worker do
 not construct this adapter, and neither should receive object-store or odds
 provider credentials.
 
+An operator may provision an empty, private evidence bucket in advance. That
+is only an infrastructure prerequisite, not approval to create a storage API
+token, deploy a worker, or make a provider request. Create the scoped token
+only after a separately reviewed private-worker implementation release has
+been merged, so it can be placed immediately in that worker's private secret
+store.
+
 `sam_analytics.s3_payload_store.S3CompatibleRawPayloadStore` is a concrete
 S3-compatible implementation of the `RawPayloadStore` contract. It supports
 AWS S3 and Cloudflare R2, but it has no public URL, polling loop, Flask route,

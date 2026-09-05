@@ -78,13 +78,19 @@ class TheOddsApiProviderTests(unittest.TestCase):
                 "x-requests-last": "1",
             }
 
+            def __init__(self):
+                self._was_read = False
+
             def __enter__(self):
                 return self
 
             def __exit__(self, *args):
                 return False
 
-            def read(self):
+            def read(self, _size):
+                if self._was_read:
+                    return b""
+                self._was_read = True
                 return raw_payload
 
         class FakeOpener:
@@ -110,6 +116,165 @@ class TheOddsApiProviderTests(unittest.TestCase):
         self.assertEqual(fetched.request_scope.markets, ("h2h", "spreads", "totals"))
         self.assertEqual(fetched.request_scope.bookmakers, ("example_book",))
         self.assertNotIn("never-expose-this-key", repr(fetched))
+
+    def test_client_rejects_declared_response_larger_than_limit_without_reading(self):
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Length": "5"}
+
+            def __init__(self):
+                self.read_called = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                self.read_called = True
+                raise AssertionError("the oversized response must not be read")
+
+        class FakeOpener:
+            def __init__(self, response):
+                self.response = response
+
+            def open(self, request, timeout):
+                return self.response
+
+        secret = "never-expose-this-key"
+        fake_response = FakeResponse()
+        with patch(
+            "sam_analytics.providers.the_odds_api.build_opener",
+            return_value=FakeOpener(fake_response),
+        ):
+            with self.assertRaisesRegex(TheOddsApiError, "response body exceeds") as raised:
+                TheOddsApiClient(secret, max_response_bytes=4).fetch_pregame_odds(
+                    "basketball_nba", now=self.now
+                )
+        self.assertFalse(fake_response.read_called)
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_client_bounds_streams_when_content_length_is_missing_or_untrustworthy(self):
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, headers):
+                self.headers = headers
+                self.read_sizes = []
+                self._chunks = iter((b"1234", b"5"))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size):
+                self.read_sizes.append(size)
+                return next(self._chunks, b"")
+
+        class FakeOpener:
+            def __init__(self, response):
+                self.response = response
+
+            def open(self, request, timeout):
+                return self.response
+
+        secret = "never-expose-this-key"
+        for headers in ({}, {"Content-Length": "1"}, {"Content-Length": "unknown"}):
+            with self.subTest(headers=headers):
+                fake_response = FakeResponse(headers)
+                with patch(
+                    "sam_analytics.providers.the_odds_api.build_opener",
+                    return_value=FakeOpener(fake_response),
+                ):
+                    with self.assertRaisesRegex(TheOddsApiError, "response body exceeds") as raised:
+                        TheOddsApiClient(secret, max_response_bytes=4).fetch_pregame_odds(
+                            "basketball_nba", now=self.now
+                        )
+                self.assertEqual(fake_response.read_sizes, [5, 1])
+                self.assertNotIn(secret, str(raised.exception))
+
+    def test_client_enforces_a_hard_response_ceiling_and_accepts_exactly_limited_streams(self):
+        for invalid_limit in (True, "4", 0, -1, 101 * 1024 * 1024):
+            with self.subTest(invalid_limit=invalid_limit), self.assertRaises(ValueError):
+                TheOddsApiClient("test-key", max_response_bytes=invalid_limit)
+
+        class FakeResponse:
+            status = 200
+
+            def __init__(self):
+                self.headers = {"Content-Length": "4"}
+                self.read_sizes = []
+                self._chunks = iter((b"[ ", b" ]"))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size):
+                self.read_sizes.append(size)
+                return next(self._chunks, b"")
+
+        class FakeOpener:
+            def __init__(self, response):
+                self.response = response
+
+            def open(self, request, timeout):
+                return self.response
+
+        response = FakeResponse()
+        with patch(
+            "sam_analytics.providers.the_odds_api.build_opener",
+            return_value=FakeOpener(response),
+        ):
+            fetched = TheOddsApiClient("test-key", max_response_bytes=4).fetch_pregame_odds(
+                "basketball_nba", now=self.now
+            )
+        self.assertEqual(fetched.raw_payload, b"[  ]")
+        self.assertEqual(fetched.quotes, [])
+        self.assertEqual(response.read_sizes, [5, 3, 1])
+
+    def test_client_rejects_content_length_mismatches_without_retaining_payload(self):
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, declared_size):
+                self.headers = {"Content-Length": declared_size}
+                self._was_read = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                if self._was_read:
+                    return b""
+                self._was_read = True
+                return b"[]"
+
+        class FakeOpener:
+            def __init__(self, response):
+                self.response = response
+
+            def open(self, request, timeout):
+                return self.response
+
+        for declared_size in ("1", "3"):
+            with self.subTest(declared_size=declared_size):
+                with patch(
+                    "sam_analytics.providers.the_odds_api.build_opener",
+                    return_value=FakeOpener(FakeResponse(declared_size)),
+                ):
+                    with self.assertRaisesRegex(TheOddsApiError, "length did not match"):
+                        TheOddsApiClient("test-key", max_response_bytes=4).fetch_pregame_odds(
+                            "basketball_nba", now=self.now
+                        )
 
     def test_client_rejects_malformed_scope_and_non_finite_provider_prices(self):
         client = TheOddsApiClient("test-key")
