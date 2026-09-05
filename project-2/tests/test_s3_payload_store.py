@@ -34,6 +34,19 @@ class _ReadErrorBody:
         return None
 
 
+class _CloseFailingBody:
+    """Readable stream whose cleanup failure must not hide verified bytes."""
+
+    def __init__(self, payload: bytes):
+        self._stream = io.BytesIO(payload)
+
+    def read(self, size: int) -> bytes:
+        return self._stream.read(size)
+
+    def close(self) -> None:
+        raise RuntimeError("simulated transport cleanup failure")
+
+
 class _FakeS3Client:
     def __init__(self):
         self.objects = {}
@@ -272,6 +285,15 @@ class S3RawPayloadStoreTests(unittest.TestCase):
         self.assertNotIn(provider_secret, str(caught.exception))
         self.assertIsNone(caught.exception.__cause__)
         self.assertIsNone(caught.exception.__context__)
+
+    def test_close_error_does_not_hide_already_verified_object_bytes(self):
+        client = _FakeS3Client()
+        client.next_get_body = _CloseFailingBody(b"[]")
+        store = S3CompatibleRawPayloadStore(self._aws_config(), client=client)
+
+        receipt = store.store(b"[]", metadata=self.metadata)
+
+        self.assertEqual(receipt.byte_count, 2)
 
     def test_r2_uses_approved_endpoint_and_never_sends_unsupported_sse_header(self):
         client = _FakeS3Client()

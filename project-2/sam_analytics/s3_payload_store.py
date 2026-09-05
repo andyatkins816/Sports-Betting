@@ -598,7 +598,7 @@ def _is_aware(value: object) -> bool:
 def _content_md5(payload: bytes) -> str:
     # Content-MD5 is the S3 transport-integrity protocol field; SHA-256
     # remains the evidence identity and content-addressed key.
-    digest = hashlib.md5(payload, usedforsecurity=False).digest()  # nosec B324
+    digest = hashlib.md5(payload, usedforsecurity=False).digest()
     return base64.b64encode(digest).decode("ascii")
 
 
@@ -648,20 +648,30 @@ def _stream_sha256(body: object, *, expected_byte_count: int) -> str:
     except Exception:
         read_failed = True
     finally:
-        close = getattr(body, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:
-                # Closing a response never changes evidence validity and must
-                # not retain a transport exception containing request details.
-                pass
+        _close_verification_body(body)
 
     if read_failed:
         raise RawPayloadStoreUnavailable("private object-store verification failed")
     if length_exceeded or byte_count != expected_byte_count:
         raise RawPayloadStoreViolation("private object-store verification failed")
     return digest.hexdigest()
+
+
+def _close_verification_body(body: object) -> None:
+    """Best-effort cleanup after a completed verification read.
+
+    A failed close cannot alter the bytes already hashed.  Returning from this
+    helper intentionally suppresses a transport-level cleanup error without
+    preserving an SDK exception chain that could contain request details.
+    """
+
+    close = getattr(body, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        return
 
 
 def _conditional_write_status(error: BaseException) -> str:
