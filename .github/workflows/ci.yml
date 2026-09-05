@@ -54,6 +54,10 @@ jobs:
         working-directory: project-2
         # `python -m` preserves this application directory on the import
         # path, allowing tests to exercise the API entry point as deployed.
+        # The disposable PostgreSQL instance also verifies that the immutable
+        # provider-receipt transaction agrees with the checked-in migrations.
+        env:
+          DATABASE_URL: postgresql://sam:sam-ci-password@127.0.0.1:5432/sam
         run: python -m pytest
       - name: Security scan
         working-directory: project-2

@@ -226,6 +226,27 @@ class MigrationRunnerTests(unittest.TestCase):
 
         self.assertNotIn(database_url, str(context.exception))
 
+    def test_checked_in_provider_receipt_migration_has_an_immutable_audit_path(self):
+        migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+        migration = next(
+            item
+            for item in discover_migrations(migrations_dir)
+            if item.filename == "004_provider_payload_receipts.sql"
+        )
+
+        self.assertIn("CREATE TABLE provider_payload_receipt", migration.sql)
+        self.assertIn("license_version TEXT NOT NULL", migration.sql)
+        self.assertIn("provider_payload_receipt_id UUID", migration.sql)
+        self.assertIn("raw_data_provenance_receipt_required_for_new_records", migration.sql)
+        self.assertIn("ADD COLUMN bookmaker TEXT", migration.sql)
+        self.assertIn("ADD COLUMN primary_provenance_id UUID", migration.sql)
+        self.assertIn("DROP CONSTRAINT IF EXISTS odds_snapshot_provider_provider_quote_id_captured_at_key", migration.sql)
+        self.assertIn("odds_snapshot_provider_evidence_required_for_new_records", migration.sql)
+        self.assertIn("enforce_raw_provenance_receipt_integrity", migration.sql)
+        self.assertIn("enforce_odds_snapshot_primary_provenance", migration.sql)
+        self.assertIn("sports_event_append_only", migration.sql)
+        self.assertIn("provider_payload_receipt_append_only", migration.sql)
+
     def _connection_for_url(self, supplied_url, expected_url, connection):
         self.assertEqual(supplied_url, expected_url)
         return connection

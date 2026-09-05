@@ -1,143 +1,311 @@
-# sam.vegas deployment runbook
+# SAM deployment runbook: GoDaddy, Base44, and Render
 
-## Recommended initial topology
+## Purpose and current safe state
 
-Use `sam.vegas` for a marketing/static landing page and `api.sam.vegas` for the
-authenticated API. Keep worker/admin endpoints private; they must not share the
-public web service route.
+SAM is a lawful, research-only sports-market analytics service. It does not
+place wagers, promise profitability, or publish predictions merely because a
+website is online.
+
+This is the current staging snapshot, checked 2026-09-04:
+
+| Component | Current state | Important limit |
+| --- | --- | --- |
+| `sam-api` | Deployed as a Render Docker web service in Oregon; `/api/healthz` and `/api/readyz` passed. | Readiness proves Postgres migrations and Key Value connectivity, not that data or a model is ready. |
+| `sam-postgres` | Private Render Postgres in Oregon, connected through `DATABASE_URL`; reviewed migrations run before deploy. | No real provider observations or model facts have been written yet. |
+| `sam-key-value` | Private Render Key Value (Valkey) in Oregon, connected through `REDIS_URL`. | It is available for future queue/cache work; no worker consumes it yet. |
+| Application environment | `APP_ENV=staging`. | Render's visible project grouping named “Production” is a UI label, not permission to treat SAM as production. |
+| `sam.vegas` | Base44 is the public experience and evidence/governance UI. | Do not point the apex domain at the Python API. |
+| `api.sam.vegas` | Reserved for the Render API custom domain. | Do not configure DNS or Base44's production status URL until Render domain validation is ready. |
+| Worker, scheduler, object storage, odds/results ingestion | Not live. | No Odds API polling, model training, or prediction delivery is authorized yet. |
+
+The desired topology is deliberately simple:
 
 ```text
-Browser → Cloudflare DNS/WAF/TLS → static site (sam.vegas)
-                                 └→ API load balancer (api.sam.vegas)
-                                       ├→ Flask/Gunicorn API (stateless)
-                                       ├→ worker + scheduler (private)
-                                       ├→ managed PostgreSQL
-                                       ├→ managed Redis/Valkey
-                                       └→ object storage for raw payloads/artifacts
-                                                  ↑
-                                   licensed data-provider adapters
+Browser
+  │
+  └─ GoDaddy DNS for sam.vegas
+       ├─ sam.vegas / www.sam.vegas  → Base44 public UI + Evidence Copilot
+       └─ api.sam.vegas              → Render sam-api (Flask/Gunicorn)
+                                             │
+                                             ├─ Render Postgres (private)
+                                             ├─ Render Key Value (Valkey/Redis-compatible, private)
+                                             ├─ future private worker/scheduler
+                                             └─ future private object storage
+                                                        ↑
+                                          licensed odds and results providers
 ```
 
-Render is a sensible first managed host: it supports Docker web services,
-background workers, cron/workflows, managed Postgres, and Redis-compatible Key
-Value. Keep production Postgres and Redis managed rather than using the local
-`compose.yaml` containers. A cloud VM is a viable lower-level alternative only
-if you are ready to own patching, backups, network segmentation, and recovery.
+Base44 presents verified evidence and explains safe status in plain language.
+The Python service remains the source of analytical facts. Neither surface may
+invent an odds feed, prediction, edge, or performance claim.
 
-## Pre-production gate
+## What is live versus what is next
 
-Do not publish a prediction/edge page yet. Before a public launch, complete:
+### Completed staging foundation
 
-1. Signed data licences and a data inventory; provider adapter contract tests;
-   no public raw-data API unless the contract expressly permits it.
-2. Migration runner plus a tested backup and point-in-time restore procedure.
-3. Private service identity for workers, managed secret store, least-privilege
-   database roles, restricted database/cache ingress, and no secrets in GitHub
-   Actions logs or Docker images.
-4. Authentication/authorization: a real identity provider for dashboards and
-   admin actions, rate limits by identity/IP, and an API gateway/WAF rule set.
-5. A locked paper/shadow evaluation with model approval records and monitoring.
-6. Terms of service, privacy policy, age/jurisdiction access rules, responsible
-   gambling disclosures, and advice from qualified counsel. Do not present a
-   model as profitable or enable wager submission without the appropriate
-   regulatory and operator authorization.
+- GitHub `main` passed CI and is the Render deployment source.
+- Render runs the Dockerized `sam-api` service in Oregon.
+- Render has generated and stores the web-service secrets; do not export,
+  reveal, or paste their values into chat, source code, Base44 client code, or
+  GitHub.
+- The unauthenticated liveness endpoint responds at `/api/healthz`.
+- Render's private Postgres and Key Value services are in the same Oregon
+  region and the API's dependency-readiness check has passed.
+
+### Explicitly not ready
+
+- The API's database migrations and dependency-readiness checks are live, but
+  the new immutable odds repository is not yet activated in a worker.
+- Key Value exists, but there is no worker, scheduler, or private object store.
+- No licensed odds/results pipeline is polling, no model artifact is approved,
+  and no public prediction delivery is enabled.
+- Base44 is not yet connected to the Python status endpoint with its separate
+  status capability.
+- `api.sam.vegas` is not yet the confirmed public API hostname.
+
+The status endpoint must therefore remain `blocked` when it is eventually
+connected to Base44. A green `/api/healthz` response is intentionally different
+from a data/model-readiness response.
 
 ## Domain, DNS, and HTTPS
 
-The existing `docs/CNAME` contains `sam.vegas`, which is appropriate only for a
-static GitHub Pages-style site. It is not an API deployment. Decide whether to
-keep that static page or replace it; avoid having two systems compete for the
-same apex records.
+GoDaddy remains the registrar and DNS provider. Cloudflare is not a required
+part of this deployment. It can be evaluated later as an optional DNS/WAF
+layer, but do not move nameservers or introduce a proxy during the initial
+cutover.
 
-1. Add `sam.vegas` to Cloudflare and change the registrar nameservers to the two
-   values Cloudflare supplies. Verify zone activation before changing traffic.
-2. Add the static-site host's custom-domain records for `sam.vegas` and `www`
-   exactly as that host instructs. Redirect one canonical host to the other.
-3. Add `api.sam.vegas` as a CNAME to the API host's target. At the host, register
-   that custom domain and enforce its domain validation before proxying traffic.
-4. Enable Cloudflare proxying only after the origin certificate is active. Set
-   SSL/TLS to **Full (strict)**, redirect HTTP to HTTPS, enable HSTS after testing
-   subdomains, and keep origin access restricted to Cloudflare/host networks.
-5. Configure a restrictive CORS allow-list (`https://sam.vegas` and
-   `https://www.sam.vegas` only), CSP, WAF/rate-limit rules, and bot/DDoS
-   controls. Never use a wildcard CORS origin for authenticated APIs.
+### Guardrails before touching DNS
 
-Cloudflare's Universal SSL covers the apex and first-level names such as
-`api.sam.vegas`; it does not remove the need for valid origin TLS and strict
-origin verification.
+1. Inventory the existing GoDaddy records. Preserve MX, SPF, DKIM, DMARC, and
+   any other email or verification records.
+2. `docs/CNAME` is a legacy GitHub Pages-style artifact containing
+   `sam.vegas`. Do not rely on it for the live site. Confirm GitHub Pages is not
+   competing for the custom domain before changing records; remove or disable
+   that legacy configuration only after the Base44 domain is verified.
+3. Copy DNS values exactly from the Base44 and Render custom-domain screens.
+   Never substitute an address or CNAME target from an old guide or another
+   service.
+4. Change only the specific hostname being configured. In particular, a CNAME
+   for `api` must not overwrite the apex (`@`) or unrelated mail records.
 
-## Service configuration and scheduled jobs
+### Configure the Base44 public site
 
-Build from `project-2/Dockerfile`. The web command is Gunicorn; it has no direct
-provider credentials beyond what it needs to validate requests. Run two separate
-private processes from the same image:
+1. In Base44, add or confirm `sam.vegas` as the public custom domain.
+2. In GoDaddy, create the exact apex and/or `www` records Base44 supplies.
+3. Pick one public canonical host (`sam.vegas` is preferred) and configure the
+   other host to redirect as Base44 instructs.
+4. Wait for Base44 domain verification and HTTPS before declaring the public UI
+   live.
 
-- `celery -A worker.celery_app worker --loglevel=INFO`
-- `celery -A worker.celery_app beat --loglevel=INFO`
+### Configure the Render API hostname
 
-The included schedule intentionally does nothing when providers are unconfigured.
-The Odds API v4 pregame adapter is implemented but deliberately not polled until
-its PostgreSQL repository and data-quality incident writer are connected. Then
-schedule polling at the agreed rate and settlement reconciliation every five
-minutes. Add a nightly model/data-quality report and a daily encrypted backup
-verification. Use a queue dead-letter strategy and idempotency keys, not blind
-retries.
+Do this only after the database/queue rollout plan is ready; it is not needed
+to prove the temporary Render service works.
 
-## Observability, security, and delivery
+1. In Render's `sam-api` settings, add the custom domain `api.sam.vegas`.
+2. Render will display a domain-validation target. In GoDaddy, add a CNAME with
+   host/name `api` and the exact target supplied by Render.
+3. Wait for Render to validate the record and provision its managed TLS
+   certificate. Do not bypass a certificate warning or force HTTPS before
+   validation completes.
+4. Verify `https://api.sam.vegas/api/healthz` returns the expected liveness
+   response over HTTPS.
+5. Keep `ALLOWED_ORIGINS` limited to `https://sam.vegas` and
+   `https://www.sam.vegas`. The Base44 status call is server-to-server and does
+   not need browser CORS access.
 
-- Emit structured JSON logs with request/job/event/provider/model IDs; redact
-  Authorization and provider keys. Send errors to Sentry (or equivalent) and
-  metrics/traces to an OpenTelemetry-compatible backend.
-- Define alerts for availability, p95 latency, 5xx rate, feed freshness, provider
-  quota, ingest/settlement lag, worker failures, dead letters, DB CPU/storage,
-  backup failures, and model/calibration drift.
-- Store secrets in the host's secret manager, rotate them, use separate
-  development/staging/production credentials, and protect production deployment
-  with MFA and branch protection. Run dependency/image scanning and secret
-  scanning in CI.
-- CI should run formatting/linting, unit/contract tests, migrations against a
-  disposable Postgres, and an image scan. CD should build an immutable image,
-  deploy staging, run smoke checks, require approval, then use a rolling or
-  blue/green production release with automatic rollback.
+Only after step 4 is successful should Base44's status gateway move to
+`https://api.sam.vegas`. Update the URL and pinned host together; see
+`BASE44_HANDOFF.md`.
 
-## Monthly operating budget (September 2026 planning estimate)
+## Secrets and trust boundaries
 
-| Stage | Platform components | Estimate, excluding data and tax |
+Use Render's encrypted environment-variable store and Base44's server-secret
+store. A secret belongs in exactly the service that needs it.
+
+| Secret/configuration | Where it belongs now | Purpose and rule |
 | --- | --- | --- |
-| Development | local containers + free DNS/TLS | $0–15 |
-| Private beta | 1 small API, 1 small worker/scheduler, managed Postgres, small Redis, object storage, error monitoring | $40–120 |
-| Reliable public service | redundant API/worker capacity, managed DB backups, Redis, WAF/observability, object storage | $200–600+ |
+| `APP_ENV=staging` | Render `sam-api` | Keeps this rollout in staging even if Render's project UI says “Production.” |
+| `SESSION_SECRET` | Render `sam-api` | Generated random value; never copied to Base44 or GitHub. |
+| `SAM_STATUS_API_KEY` | Render `sam-api`, then Base44 server secret named `SAM_BACKEND_STATUS_API_KEY` | The only credential that authorizes `GET /api/v1/integration/status`. Send it only as a server-side `X-API-Key` header. |
+| `SAM_API_KEY` | Render only, if retained | Reserved for the separate private research capability. Never send this key to Base44; that capability is disabled outside development/test. |
+| `ALLOWED_ORIGINS` | Render `sam-api` | Exact public Base44 origins only; never use `*` for an authenticated API. |
+| `DATABASE_URL` | Render `sam-api` and future worker | Use Render's internal Postgres connection string, not an external URL. The current readiness endpoint checks it without revealing it. |
+| `REDIS_URL` | Render `sam-api` and future worker | Use only the private/internal Key Value connection string. The current readiness endpoint checks it without revealing it. |
+| `ODDS_PROVIDER_API_KEY` | Future private worker only | Rotate the previously exposed key first. Never add it to the web API, Base44, browser, GitHub, or logs. |
+| object-storage credentials | Future private worker only | Use a least-privilege service identity limited to SAM's bucket/prefix. |
 
-For an inexpensive managed proof of concept, Render reports an always-on small
-web service plus small Postgres at about $13/month before growth; this system
-also needs at least a worker and persistent queue/cache, so use the higher beta
-range as the actual planning floor. Render bills services independently and
-usage/bandwidth can change the number.
+Never use a URL query parameter for a secret. Never expose secrets through an
+API response, Base44 entity, client-side JavaScript, logs, screenshots, or an
+AI-agent prompt.
 
-Data is the variable cost that matters most. The Odds API currently lists $29/mo
-for 20,000 requests and $99/mo for 200,000 requests with additional historical
-and market coverage; its enterprise/official-feed alternatives require quotes.
-Do not regard a retail API plan as equivalent to professional low-latency or
-official data rights.
+## Staged infrastructure rollout
 
-## Hosting decision
+### Stage 1 — maintain and validate Postgres
 
-Start with: Cloudflare + Render + managed Postgres/Key Value + S3-compatible
-object storage + licensed pregame odds/results provider. Revisit a cloud account
-(AWS/GCP/Azure) when you need private networking across more services, audited
-IAM, multi-region recovery, or vendor-compliance requirements. The data contract
-and evidence pipeline—not a more complicated neural network—are the next
-critical investment.
+1. Keep `sam-postgres` in Oregon with `sam-api`.
+2. Keep the Render internal database URL in `DATABASE_URL`; never replace it
+   with a public endpoint.
+3. The numbered migration runner already executes as the reviewed pre-deploy
+   command. For each future migration, record the version and verify a restore
+   procedure before loading real provider data.
+4. Restrict database access to Render services that require it. Use a
+   least-privilege application role once the repository is implemented.
 
-## Primary references (checked 2026-09-04)
+### Stage 2 — keep the private queue/cache ready
 
-- Render service types, managed Postgres/Key Value, and free-tier limitations:
-  <https://render.com/docs/service-types>
-- Render current cost guidance and billing variables:
-  <https://render.com/articles/how-much-does-cloud-application-hosting-cost-for-small-businesses>
-- Cloudflare Universal SSL setup and coverage:
-  <https://developers.cloudflare.com/ssl/edge-certificates/universal-ssl/enable-universal-ssl/>
-- The Odds API published plans/coverage:
-  <https://theoddsapi.com/pricing>
-- The Odds API terms, especially limits on reselling/repackaging raw data:
-  <https://the-odds-api.com/terms-and-conditions.html>
+1. Keep `sam-key-value` in Oregon in the same project.
+2. Keep its internal endpoint in `REDIS_URL`; do not expose the service
+   publicly.
+3. Verify queue connectivity independently. A configured URL is not evidence
+   that a worker is healthy.
+4. Do not begin a worker solely because a broker exists. The worker needs
+   reviewed database persistence, idempotency, retry/dead-letter handling, and
+   alerting first.
+
+### Stage 3 — add private immutable object storage
+
+Use an S3-compatible provider selected for the applicable data-license and
+retention requirements. Store only the data the provider contract permits SAM
+to retain.
+
+- Keep the bucket private; block anonymous listing and public object reads.
+- Encrypt data at rest and in transit; enable versioning or write-once evidence
+  controls where available.
+- Separate raw provider payloads, model artifacts, and reports by restricted
+  prefixes/buckets with lifecycle policies.
+- Store provider responses, feature snapshots, model artifacts, calibration
+  reports, and backups only after their contracts and retention rules are
+  documented.
+- Give the public API no broad object-storage credentials. The future worker
+  should receive the smallest write/read scope necessary.
+
+### Stage 4 — start the private worker and scheduler
+
+Use the same reviewed container image in a Render Background Worker or private
+job, never as a public web route. The worker command will be:
+
+```text
+celery -A worker.celery_app worker --loglevel=INFO
+```
+
+Do not start Celery Beat. A later Render Cron Job should enqueue one bounded
+ingestion run at a reviewed cadence; that avoids a hidden always-on scheduler
+and makes quota use easier to audit.
+
+Before starting them, implement and test all of the following:
+
+- transactional Postgres persistence and source-received timestamps;
+- idempotency keys and a dead-letter/review path;
+- a results-provider contract and settlement reconciliation;
+- worker health records consumed by the status contract;
+- rate limits that respect the provider agreement and quota;
+- alerts for failures, queue depth, stalled jobs, stale data, and quota loss.
+
+The current worker deliberately does not poll or train when a provider has not
+been fully configured. This is a safety feature, not an outage.
+
+### Stage 5 — provider onboarding and model governance
+
+1. Rotate the Odds API credential that was shared outside a secret manager.
+2. Review the provider's current storage, derivation, display, and
+   redistribution rights before enabling any feed.
+3. Store the replacement credential only in the private worker configuration.
+4. Start with a paper/shadow ingest and verify lineage, freshness, and
+   settlement before a model is eligible for review.
+5. Require time-split backtests, calibration, approved immutable artifacts,
+   monitoring, and an explicit approval record. No model is “ready” from a
+   neural-network or gradient-boosting score alone.
+
+## Base44 integration after API DNS is verified
+
+Base44 is a server-side gateway and evidence experience, not a second prediction
+engine. After `https://api.sam.vegas/api/healthz` verifies:
+
+1. Set Base44 server secret `SAM_BACKEND_URL` to `https://api.sam.vegas`.
+2. Set Base44 server secret `SAM_BACKEND_HOST` to `api.sam.vegas`.
+3. Set Base44 server secret `SAM_BACKEND_STATUS_API_KEY` to the value of
+   Render's separate `SAM_STATUS_API_KEY`.
+4. Have the Base44 backend function call only
+   `GET /api/v1/integration/status` with `X-API-Key`.
+5. Confirm Base44 renders a transparent `blocked` state until independently
+   verified operational evidence exists.
+
+Do not put the status key in a React component, browser storage, a Base44 AI
+prompt, or a client-visible entity. Do not use `SAM_API_KEY` in Base44.
+
+Python-to-Base44 evidence publishing is a later, separate capability. It needs
+a new random webhook secret and the host-pinned, signed webhook configuration
+described in `BASE44_HANDOFF.md`. It must not reuse the status or provider key.
+
+## Monitoring, security, and deployment operations
+
+### Immediate controls
+
+- Keep Render's health check at `/api/healthz`; treat it as liveness only.
+- Turn on Render service/database notifications for deploy failures and service
+  availability.
+- Keep GitHub pull-request checks required before merging to `main`; enable MFA
+  for GitHub, Render, GoDaddy, Base44, and any provider account.
+- Review Render deploy logs after every environment-variable or database change.
+- Keep the public API rate-limited at the application/edge layer before broad
+  use. A future WAF/DDoS layer can be added after the basic domain cutover.
+
+### Before operational data is accepted
+
+- Add structured logs with request, job, provider, event, and model IDs while
+  redacting Authorization headers and all secret values.
+- Add error reporting and metrics/traces (for example, Sentry plus an
+  OpenTelemetry-compatible backend).
+- Alert on API availability, p95 latency, 5xx rate, database errors/storage,
+  queue/worker failures, feed freshness, provider quota, ingest/settlement lag,
+  dead letters, backup failures, and calibration/model drift.
+- Test a Postgres backup/restore and access revocation procedure.
+- Use a reviewed deployment path: CI → staging deploy → smoke check → human
+  approval → production release and rollback plan.
+
+## Budget and purchase gates
+
+The verified initial Render baseline is approximately:
+
+| Resource | Selected plan | Monthly cost before tax/usage |
+| --- | --- | --- |
+| `sam-api` | small always-on web service | $7 |
+| `sam-postgres` | small managed Postgres | $6 |
+| `sam-key-value` | small persistent Valkey/Key Value | $10 |
+| Current baseline | API + database + Key Value | **$23** |
+
+Do not infer future prices from this baseline. Before enabling more components,
+check Render's current checkout price for a Key Value instance and Background
+Worker, then add object storage, monitoring, bandwidth, backups, and provider
+costs. The data feed is likely the largest variable cost; a retail odds plan is
+not equivalent to official or low-latency syndicate-grade data rights.
+
+Suggested purchasing order:
+
+1. Finish database integration and restore verification.
+2. Add Key Value and a private worker only after persistence/operations work is
+   ready.
+3. Add private object storage before retaining licensed raw data or model
+   artifacts.
+4. Purchase/enable a provider only after its terms, quotas, and permitted uses
+   are documented.
+5. Upgrade capacity only from measured CPU, memory, query, queue, and latency
+   evidence.
+
+## Legal and product-release gate
+
+Before publishing a prediction/edge page or allowing users to act on model
+output, complete signed data licenses, a data inventory, privacy/terms,
+age/jurisdiction rules, responsible-gambling disclosures, model approvals,
+monitoring, and jurisdiction-specific legal review. Do not enable wager
+submission without the necessary regulatory and operator authorization.
+
+## Primary references
+
+- Render service types: <https://render.com/docs/service-types>
+- Render environment variables: <https://render.com/docs/configure-environment-variables>
+- Render health checks: <https://render.com/docs/health-checks>
+- Render custom domains: <https://render.com/docs/custom-domains>
+- Render Postgres backups/recovery: <https://render.com/docs/postgresql-backups>
+- The Odds API terms: <https://the-odds-api.com/terms-and-conditions.html>
