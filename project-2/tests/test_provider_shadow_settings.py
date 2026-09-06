@@ -6,6 +6,7 @@ import unittest
 from dataclasses import fields
 
 from sam_analytics.provider_shadow_settings import (
+    PROVIDER_PRODUCTION_EVIDENCE_URI,
     PROVIDER_SHADOW_ALLOWED_SPORT_KEYS,
     PROVIDER_SHADOW_EVIDENCE_URI,
     PROVIDER_SHADOW_LICENSE_SCOPE,
@@ -85,9 +86,25 @@ class ProviderShadowSettingsTests(unittest.TestCase):
         ):
             self.assertNotIn(private_value, rendered)
 
+    def test_production_requires_the_production_evidence_bucket(self) -> None:
+        environment = self._environment()
+        environment["APP_ENV"] = "production"
+        environment["SAM_RAW_EVIDENCE_STORE_URI"] = PROVIDER_PRODUCTION_EVIDENCE_URI
+
+        settings = ProviderShadowSettings.from_environment(environment)
+
+        self.assertEqual(settings.environment, "production")
+        self.assertEqual(
+            settings.raw_evidence_store_uri,
+            "s3://sam-raw-evidence-prod/raw/the_odds_api",
+        )
+
+        environment["SAM_RAW_EVIDENCE_STORE_URI"] = PROVIDER_SHADOW_EVIDENCE_URI
+        with self.assertRaises(ProviderShadowConfigurationError):
+            ProviderShadowSettings.from_environment(environment)
+
     def test_every_capability_and_request_scope_value_is_exact(self) -> None:
         changes = (
-            ("APP_ENV", "production"),
             ("APP_ENV", "development"),
             ("SAM_WORKER_ROLE", "worker"),
             ("SAM_WORKER_MODE", "synthetic_storage_probe"),

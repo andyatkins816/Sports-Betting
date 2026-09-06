@@ -116,8 +116,15 @@ class ProviderWorkerTests(unittest.TestCase):
         valid = self._environment()
         self._load_worker(valid)
 
+        production = dict(valid)
+        production["APP_ENV"] = "production"
+        production["SAM_RAW_EVIDENCE_STORE_URI"] = (
+            "s3://sam-raw-evidence-prod/raw/the_odds_api"
+        )
+        self._load_worker(production)
+
         for name, value in (
-            ("APP_ENV", "production"),
+            ("APP_ENV", "development"),
             ("SAM_WORKER_MODE", "synthetic_storage_probe"),
             ("SAM_INGESTION_ENABLED", "false"),
             ("SAM_ODDS_MARKETS", "spreads"),
