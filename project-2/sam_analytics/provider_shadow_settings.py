@@ -1,4 +1,4 @@
-"""Fail-closed settings for one bounded The Odds API shadow worker.
+"""Fail-closed settings for the bounded The Odds API shadow worker.
 
 This module defines configuration admission only.  Importing it does not create
 a provider client, contact a service, register a Celery task, or start a
@@ -13,16 +13,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
-from uuid import UUID
+
 
 PROVIDER_SHADOW_EVIDENCE_URI = "s3://sam-raw-evidence-staging/raw/the_odds_api"
 PROVIDER_SHADOW_MAX_BYTES = 10 * 1024 * 1024
-# One reviewed release gets one durable audit identity.  Within the same
-# append-only staging audit database, PostgreSQL's primary key rejects every
-# later task before the provider fetch is called.  Enabling a future request
-# therefore requires a deliberate, reviewed code change rather than a normal
-# operator-controlled environment override.
-PROVIDER_SHADOW_ADMISSION_RUN_ID = UUID("f3cd3650-568a-4f36-89b8-acde937c23a1")
 PROVIDER_SHADOW_ALLOWED_SPORT_KEYS = frozenset(
     {"americanfootball_nfl", "baseball_mlb", "basketball_nba"}
 )

@@ -1,4 +1,4 @@
-"""Tests for the one-request The Odds API provider-shadow worker."""
+"""Tests for the bounded The Odds API provider-shadow worker."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ import importlib.util
 import inspect
 import os
 import sys
+import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
 from sam_analytics.ingestion_runs import IngestionFailureCode
@@ -85,7 +86,7 @@ class ProviderWorkerTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self._load_worker(changed)
 
-    def test_worker_has_one_manual_queue_and_no_automatic_path(self) -> None:
+    def test_worker_has_one_queue_and_fixed_five_minute_schedule(self) -> None:
         environment = self._environment()
         worker = self._load_worker(environment)
         app = worker.create_celery_app(environment)
@@ -99,7 +100,20 @@ class ProviderWorkerTests(unittest.TestCase):
         self.assertEqual(app.conf.worker_prefetch_multiplier, 1)
         self.assertEqual(app.conf.worker_concurrency, 1)
         self.assertFalse(app.conf.task_create_missing_queues)
-        self.assertEqual(app.conf.beat_schedule, {})
+        self.assertEqual(
+            app.conf.beat_schedule_filename,
+            os.path.join(tempfile.gettempdir(), "sam-provider-shadow-celerybeat-schedule"),
+        )
+        self.assertEqual(
+            app.conf.beat_schedule,
+            {
+                "ingest-the-odds-api-shadow-every-five-minutes": {
+                    "task": "sam_analytics.ingest_the_odds_api_shadow",
+                    "schedule": 300,
+                    "options": {"queue": "sam_provider_shadow", "expires": 240},
+                }
+            },
+        )
         self.assertFalse(app.conf.task_send_sent_event)
         self.assertFalse(app.conf.worker_send_task_events)
         self.assertFalse(app.conf.worker_enable_remote_control)
@@ -215,13 +229,14 @@ class ProviderWorkerTests(unittest.TestCase):
             job_identity=f"celery:{task_id}",
             license_scope="internal_analytics_only",
             license_version="terms-2026-08-31",
-            run_id=worker.PROVIDER_SHADOW_ADMISSION_RUN_ID,
+            run_id=UUID(task_id),
         )
 
     def test_only_canonical_uuid_task_ids_enter_the_audit_ledger(self) -> None:
         worker = self._load_worker(self._environment())
         task_id = str(uuid4())
 
+        self.assertEqual(worker._canonical_task_uuid(task_id), UUID(task_id))
         self.assertEqual(worker._celery_job_identity(task_id), f"celery:{task_id}")
         for unsafe in (None, "", "manual-task", task_id + "?key=secret"):
             with self.subTest(unsafe=unsafe):

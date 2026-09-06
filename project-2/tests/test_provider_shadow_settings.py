@@ -6,7 +6,6 @@ import unittest
 from dataclasses import fields
 
 from sam_analytics.provider_shadow_settings import (
-    PROVIDER_SHADOW_ADMISSION_RUN_ID,
     PROVIDER_SHADOW_ALLOWED_SPORT_KEYS,
     PROVIDER_SHADOW_EVIDENCE_URI,
     PROVIDER_SHADOW_LICENSE_SCOPE,
@@ -61,10 +60,6 @@ class ProviderShadowSettingsTests(unittest.TestCase):
         self.assertEqual(settings.markets, ("h2h",))
         self.assertEqual(settings.license_scope, "internal_analytics_only")
         self.assertEqual(settings.license_version, "terms-2026-08-31")
-        self.assertEqual(
-            str(PROVIDER_SHADOW_ADMISSION_RUN_ID),
-            "f3cd3650-568a-4f36-89b8-acde937c23a1",
-        )
         self.assertEqual(
             settings.raw_evidence_store_uri,
             "s3://sam-raw-evidence-staging/raw/the_odds_api",

@@ -1,16 +1,17 @@
-"""Fail-closed Celery entry point for one manual provider-shadow request.
+"""Fail-closed Celery entry point for bounded provider-shadow requests.
 
 This is intentionally separate from both the public web service and the
 synthetic storage-probe worker.  It can make one narrowly scoped The Odds API
-request only when every staging, license, database, broker, and evidence-store
-setting passes admission.  It has no schedule, retry path, results backend, or
-public-output path.
+request per task only when every staging, license, database, broker, and
+evidence-store setting passes admission.  It has a fixed five-minute schedule,
+with no retry path, results backend, or public-output path.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import replace
 from uuid import UUID
@@ -31,7 +32,6 @@ from sam_analytics.provider_shadow import (
     ProviderShadowFetchFailure,
 )
 from sam_analytics.provider_shadow_settings import (
-    PROVIDER_SHADOW_ADMISSION_RUN_ID,
     ProviderShadowConfigurationError,
     ProviderShadowSettings,
 )
@@ -47,6 +47,7 @@ WorkerConfigurationError = ProviderShadowConfigurationError
 
 _PROVIDER_SHADOW_QUEUE = "sam_provider_shadow"
 _PROVIDER_SHADOW_TASK = "sam_analytics.ingest_the_odds_api_shadow"
+_PROVIDER_SHADOW_INTERVAL_SECONDS = 5 * 60
 _HTTP_STATUS_RE = re.compile(r"^The Odds API returned HTTP ([1-5][0-9]{2})$")
 _RAW_ONLY_PROVIDER_ADDED_MARKETS = frozenset({"h2h_lay"})
 
@@ -69,9 +70,9 @@ def create_celery_app(environ: Mapping[str, str] | None = None) -> Celery:
         task_ignore_result=True,
         task_store_errors_even_if_ignored=False,
         task_track_started=False,
-        # In the same durable audit database, the fixed, code-reviewed run ID
-        # prevents redelivery or repeated manual publication from reaching the
-        # provider.
+        # A redelivered task keeps its Celery UUID, which is also the durable
+        # ingestion-run ID. The database therefore rejects that redelivery
+        # before another provider request can start.
         task_acks_late=False,
         task_reject_on_worker_lost=False,
         worker_prefetch_multiplier=1,
@@ -87,16 +88,26 @@ def create_celery_app(environ: Mapping[str, str] | None = None) -> Celery:
         task_send_sent_event=False,
         worker_send_task_events=False,
         worker_enable_remote_control=False,
-        beat_schedule={},
+        beat_schedule_filename=os.path.join(
+            tempfile.gettempdir(), "sam-provider-shadow-celerybeat-schedule"
+        ),
+        beat_schedule={
+            "ingest-the-odds-api-shadow-every-five-minutes": {
+                "task": _PROVIDER_SHADOW_TASK,
+                "schedule": _PROVIDER_SHADOW_INTERVAL_SECONDS,
+                # Never drain stale scheduled work in a burst after downtime.
+                "options": {"queue": _PROVIDER_SHADOW_QUEUE, "expires": 4 * 60},
+            }
+        },
     )
     return app
 
 
-def _celery_job_identity(task_id: object) -> str:
-    """Convert only a canonical Celery UUID into a safe audit identity."""
+def _canonical_task_uuid(task_id: object) -> UUID:
+    """Return only a canonical Celery UUID for durable run identity."""
 
     if not isinstance(task_id, str):
-        raise WorkerConfigurationError("the manual provider-shadow task identity is invalid")
+        raise WorkerConfigurationError("the provider-shadow task identity is invalid")
     parsed: UUID | None = None
     parse_failed = False
     try:
@@ -104,8 +115,14 @@ def _celery_job_identity(task_id: object) -> str:
     except (AttributeError, TypeError, ValueError):
         parse_failed = True
     if parse_failed or parsed is None or str(parsed) != task_id.lower():
-        raise WorkerConfigurationError("the manual provider-shadow task identity is invalid")
-    return f"celery:{parsed}"
+        raise WorkerConfigurationError("the provider-shadow task identity is invalid")
+    return parsed
+
+
+def _celery_job_identity(task_id: object) -> str:
+    """Convert only a canonical Celery UUID into a safe audit identity."""
+
+    return f"celery:{_canonical_task_uuid(task_id)}"
 
 
 def _classify_provider_error(error: TheOddsApiError) -> IngestionFailureCode:
@@ -201,7 +218,8 @@ def _execute_provider_shadow(
 
     source = os.environ if environ is None else environ
     settings = ProviderShadowSettings.from_environment(source)
-    job_identity = _celery_job_identity(task_id)
+    run_id = _canonical_task_uuid(task_id)
+    job_identity = f"celery:{run_id}"
 
     client = TheOddsApiClient(
         source["ODDS_PROVIDER_API_KEY"],
@@ -235,7 +253,7 @@ def _execute_provider_shadow(
         job_identity=job_identity,
         license_scope=settings.license_scope,
         license_version=settings.license_version,
-        run_id=PROVIDER_SHADOW_ADMISSION_RUN_ID,
+        run_id=run_id,
     )
 
 
@@ -252,6 +270,6 @@ celery_app = create_celery_app()
     max_retries=0,
 )
 def ingest_the_odds_api_shadow(task) -> None:
-    """Run one operator-dispatched private provider-shadow ingestion."""
+    """Run one scheduled or operator-dispatched provider-shadow ingestion."""
 
     _execute_provider_shadow(task_id=task.request.id)
