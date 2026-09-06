@@ -16,8 +16,8 @@ This is the current staging snapshot, checked 2026-09-05:
 | Application environment | `APP_ENV=staging`. | Render's visible project grouping named “Production” is a UI label, not permission to treat SAM as production. |
 | `sam.vegas` | Base44 is the public experience and evidence/governance UI. | Do not point the apex domain at the Python API. |
 | `api.sam.vegas` | Reserved for the Render API custom domain. | Do not configure DNS or Base44's production status URL until Render domain validation is ready. |
-| Raw evidence storage | Private Cloudflare R2 buckets `sam-raw-evidence-staging` and `sam-raw-evidence-prod` are provisioned with Standard storage and public access disabled. | Staging contains the verified content-addressed synthetic proof under `raw/synthetic/`; production remains empty. The temporary token is no longer attached to the worker and has a short expiration. |
-| Workers and ingestion | `sam-synthetic-worker` completed its one audited proof and is suspended. A separate one-request provider-shadow worker is implemented but not yet admitted operationally. | No scheduled polling, results ingestion, model training, or prediction delivery is authorized. |
+| Raw evidence storage | Private Cloudflare R2 buckets `sam-raw-evidence-staging` and `sam-raw-evidence-prod` are provisioned with Standard storage and public access disabled. | Staging contains the verified content-addressed synthetic and one-request provider proofs under their separate locked prefixes; production remains empty. The temporary provider-proof R2 token was deleted. |
+| Workers and ingestion | Both one-request staging proofs succeeded. `sam-synthetic-worker` and `sam-provider-shadow-worker` are suspended; the provider and R2 credentials were removed from the latter. | No scheduled polling, results ingestion, model training, or prediction delivery is authorized. The replacement provider credential was rotated after the proof. |
 
 The desired topology is deliberately simple:
 
@@ -55,11 +55,10 @@ invent an odds feed, prediction, edge, or performance claim.
 
 ### Explicitly not ready
 
-- The API's database migrations and dependency-readiness checks are live, but
-  the new immutable odds repository is not yet activated in a worker.
-- The synthetic worker is suspended after its successful proof. The separate
-  provider-shadow worker is not deployed, has no provider key, and has no
-  storage token; no scheduler exists.
+- The immutable odds repository passed one bounded provider-shadow proof, but
+  it is not activated for recurring ingestion.
+- Both proof workers are suspended. The provider-shadow worker has no provider
+  key or storage token, and no scheduler exists.
 - No licensed odds/results pipeline is polling, no model artifact is approved,
   and no public prediction delivery is enabled.
 - Base44 is not yet connected to the Python status endpoint with its separate
@@ -183,14 +182,13 @@ the provider worker constructs the adapter.
 
 - Keep the bucket private; block anonymous listing and public object reads.
 - Leave `sam-raw-evidence-prod` empty and credential-free while the application
-  is staging. The fixed synthetic proof already exists under
-  `sam-raw-evidence-staging/raw/synthetic`; its temporary credentials were
-  removed from the suspended worker and the short-lived token is expiring.
-- Before the one provider-shadow request, add a separate seven-day R2
-  bucket-lock rule for `raw/the_odds_api/` and create a new staging-bucket-only
-  token. Remove it from the worker immediately after the three-system
-  verification and revoke it when possible; otherwise rely only on its shortest
-  approved expiration.
+  is staging. The fixed synthetic proof exists under
+  `sam-raw-evidence-staging/raw/synthetic/`, and the single provider proof
+  exists under `raw/the_odds_api/`; both prefixes retain their reviewed
+  seven-day lock.
+- The provider-proof R2 token was removed from the worker and permanently
+  deleted after the three-system verification. Create a new least-privilege,
+  staging-bucket-only identity only after a later activation review.
 - Encrypt data at rest and in transit; enable versioning or write-once evidence
   controls where available.
 - Separate raw provider payloads, model artifacts, and reports by restricted
@@ -209,23 +207,34 @@ PostgreSQL. Its worker is suspended, its temporary R2 credentials were removed,
 and the short-lived token is expiring. Keep it that way; it never receives a
 provider credential.
 
-The next checkpoint is one request through the separate provider-shadow
-worker. Follow
-[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md) exactly. Its
-queue, environment, R2 prefix/token, task name, and worker service must remain
-separate from the synthetic worker. Do not start Celery Beat, create a Cron
-Job, enable automatic deploys, or infer success from a Render `Live` badge.
+The separate provider-shadow checkpoint also completed successfully. The
+single task `29ab597f-df4f-41cc-9a95-40b08732899c` produced the audited run
+`f3cd3650-568a-4f36-89b8-acde937c23a1`, a matching receipt/provenance record,
+and the private R2 object with digest
+`309b6d1cdd2b999c6830bd4cd4492d17e919c65c62e6e5385c1f703c9d0a898b`.
+The latest audit state was `succeeded` with one attempt. The worker was then
+suspended, its temporary provider/R2 values were removed, the provider key was
+rotated, and the R2 token was deleted.
 
-That single shadow proof is still not a general provider dispatcher. Before
-starting scheduled or production ingestion, implement and test all of the
+That proof is still not a general provider dispatcher. The inactive
+[ingestion control-plane safety boundary](INGESTION_CONTROL_PLANE.md) now
+defines deterministic idempotency, quota/spacing/batch admission, bounded
+retry/dead-letter decisions, append-only transactional dispatch facts, and a
+sanitized monitoring projection. It is deliberately unwired and disabled by
+default; it made no additional provider request and creates no schedule.
+
+Before starting scheduled or production ingestion, finish and test all of the
 following:
 
 - transactional Postgres persistence and source-received timestamps;
-- idempotency keys and a dead-letter/review path;
+- a transactional repository/outbox publisher that uses the new idempotency,
+  quota-reservation, and dead-letter records;
 - a results-provider contract and settlement reconciliation;
-- worker health records consumed by the status contract;
-- rate limits that respect the provider agreement and quota;
-- alerts for failures, queue depth, stalled jobs, stale data, and quota loss.
+- a trusted database adapter that supplies the new ingestion-health contract;
+- production-reviewed rate limits that respect the provider agreement and
+  current subscription quota; and
+- delivery of finite alerts for failures, queue depth, stalled jobs, stale
+  data, and quota loss to a private monitoring service.
 
 Neither manual worker can settle, train, publish predictions, or place wagers.
 This is a safety boundary, not an outage.

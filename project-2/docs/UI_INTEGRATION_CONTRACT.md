@@ -46,25 +46,43 @@ Their behavior is:
 - `model_health`: whether an identified model is approved, its artifact is
   verified, and an evaluation/monitoring report is present. It does not judge a
   model by accuracy alone or make a profitability claim.
-- `status`: `ready` only when the audit database and queue are configured, data
-  is fresh, and the model is healthy. All other states are `blocked`.
+- `status`: `ready` only when the audit database and queue are configured and
+  verified healthy, data is fresh, ingestion health is current and healthy,
+  and the model is healthy. All other states are `blocked`.
 - `deployment`: sanitized infrastructure configuration state, a contract
-  version, explicit blockers, and whether prediction delivery remains disabled.
+  version, explicit blockers, whether prediction delivery remains disabled,
+  and a nested `ingestion` health projection.
 - `risk_status`: research-only mode and the permanent fact that wager
   submission is unsupported.
 
-Until a Postgres-backed health repository is wired in, the endpoint receives no
-operational signals and intentionally returns `blocked`. This is the desired
-rollout behavior: the interface should render a transparent unavailable state,
-not substitute Base44 or LLM-generated predictions.
+Contract `v2` adds `deployment.ingestion`. It exposes only finite states,
+rounded ages, configured age limits, queue/quota/count bands, and sorted alert
+codes. It does not expose exact quota or dead-letter counts, queue or worker
+identities, task IDs, request fingerprints, payload digests, private object
+URIs, provider endpoints, or exception text. Its `worker_activity` field is
+explicitly based on durable transitions; it is not a heartbeat or a process
+liveness claim. The internal evaluated value is provider-bound and expires
+after at most five seconds, sooner when a known component-age boundary would
+be crossed. If it is stale, future-dated, or does not match the validated
+provider named by the data-freshness facts, the ingestion projection is
+unavailable with `monitoring_invalid` and cannot satisfy readiness.
+
+Until a Postgres-backed health adapter is wired in, the endpoint receives no
+trusted ingestion facts and intentionally returns `blocked` with ingestion
+health `unavailable`. This is the desired rollout behavior: the interface
+should render a transparent unavailable state, not substitute Base44 or
+LLM-generated predictions.
 
 ## Worker and monitoring integration
 
-The ingestion and model-report workers should update a trusted internal health
-repository using source-received timestamps, model registry approvals, artifact
-checksums, and validation-report timestamps. The API process can then load that
-record into `OperationalSignals` before creating this response. Do not accept
-health signals from a browser request.
+The future ingestion adapter should derive health from immutable dispatch
+transitions, outstanding reservations, provider quota receipts, and actual
+`odds_snapshot.received_at` observations. A successful empty receipt does not
+make quote freshness healthy. It must query the same provider used by the
+top-level freshness facts. The model-report path should continue to use model
+registry approvals, artifact checksums, and validation-report timestamps. The
+API process can load these trusted facts into `OperationalSignals` before
+creating the response. Do not accept health signals from a browser request.
 
 Alert on any transition to `stale`, `invalid`, `unapproved`,
 `artifact_unverified`, or `monitoring_unavailable`, as well as repeated
