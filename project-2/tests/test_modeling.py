@@ -30,6 +30,7 @@ from sam_analytics.modeling import (
     RollingTimeSplitter,
     adapt_labeled_training_examples,
     build_estimator,
+    build_h2h_market_prediction_inputs,
     build_h2h_market_training_rows,
     cross_fit_isotonic_calibration,
     default_model_candidates,
@@ -238,6 +239,50 @@ class ModelingContractTests(unittest.TestCase):
         )
 
         self.assertEqual([row.event_id for row in rows], ["earlier", "later"])
+
+    def test_live_market_input_matches_training_horizon_and_coherent_batches(self):
+        starts_at = self.start + timedelta(hours=2)
+        now = starts_at - timedelta(minutes=20)
+        records = self._market_records(starts_at=starts_at)
+        late_batch = [
+            {
+                **record,
+                "odds_snapshot_id": f"late-{record['odds_snapshot_id']}",
+                "primary_provenance_id": f"late-{record['primary_provenance_id']}",
+                "captured_at": starts_at - timedelta(minutes=25),
+                "quote_received_at": starts_at - timedelta(minutes=25),
+                "decimal_odds": 9.0,
+            }
+            for record in records
+        ]
+
+        inputs = build_h2h_market_prediction_inputs(
+            reversed(records + late_batch),
+            sport="basketball_nba",
+            now=now,
+            released_at=self.start,
+        )
+
+        self.assertEqual(len(inputs), 1)
+        request = inputs[0]
+        self.assertEqual(request.event_id, "market-event")
+        self.assertEqual(request.decision_at, starts_at - timedelta(minutes=30))
+        self.assertEqual(request.features_available_at, starts_at - timedelta(hours=1))
+        self.assertAlmostEqual(request.features["market_probability"], 0.475)
+        self.assertTrue(all(not snapshot.startswith("late-") for snapshot in request.source_snapshot_ids))
+
+    def test_live_market_input_never_retro_scores_before_model_release(self):
+        starts_at = self.start + timedelta(hours=2)
+        records = self._market_records(starts_at=starts_at)
+
+        inputs = build_h2h_market_prediction_inputs(
+            records,
+            sport="basketball_nba",
+            now=starts_at - timedelta(minutes=20),
+            released_at=starts_at - timedelta(minutes=29),
+        )
+
+        self.assertEqual(inputs, ())
 
     def test_feature_contract_rejects_future_and_unknown_inputs(self):
         request = PredictionInput(
