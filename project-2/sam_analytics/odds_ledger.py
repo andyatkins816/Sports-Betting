@@ -10,9 +10,9 @@ and hands it to this ledger.  The ledger then enforces the important ordering:
    provenance links, and a safe operational signal to PostgreSQL.
 
 Nothing in this module returns a provider credential, raw response body, or a
-private object URL.  It also intentionally has no network polling function;
-the future worker must be explicitly enabled only after this persistence
-boundary and its object-storage configuration are verified.
+private object URL.  It also intentionally has no network polling function; a
+separately admitted private worker must be explicitly enabled only after this
+persistence boundary and its object-storage configuration are verified.
 """
 
 from __future__ import annotations
@@ -338,17 +338,18 @@ class OddsLedger:
                         payload_sha256=stored_payload.payload_sha256,
                         received_at=payload.received_at,
                     )
+                    status = "accepted" if normalized_quotes else "accepted_empty"
                     _insert_provider_signal(
                         cursor,
                         payload=payload,
                         provenance=provenance,
-                        status="accepted",
+                        status=status,
                         snapshots_created=created,
                         snapshots_replayed=replayed,
                         incidents_created=0,
                     )
                     return LedgerWriteResult(
-                        status="accepted",
+                        status=status,
                         receipt_sha256=payload.receipt_sha256,
                         provenance_sha256=provenance.digest,
                         events_created=events_created,
@@ -380,7 +381,7 @@ def prepare_the_odds_api_payload(
     """Convert one already-fetched Odds API response into private evidence.
 
     This helper intentionally accepts the response object rather than a client
-    or API key.  It performs no HTTP request.  A future worker can call it only
+    or API key.  It performs no HTTP request.  A private worker can call it only
     after it has a reviewed provider contract and a real private object store.
     """
 
@@ -392,8 +393,8 @@ def prepare_the_odds_api_payload(
         raise OddsLedgerValidationError("provider fetch does not contain raw response bytes")
     if not _aware(received_at):
         raise OddsLedgerValidationError("provider fetch does not contain a local receipt time")
-    if not isinstance(quotes, list) or not quotes or not all(isinstance(quote, RawOddsQuote) for quote in quotes):
-        raise OddsLedgerValidationError("provider fetch does not contain pregame quotes")
+    if not isinstance(quotes, list) or not all(isinstance(quote, RawOddsQuote) for quote in quotes):
+        raise OddsLedgerValidationError("provider fetch does not contain a valid pregame quote collection")
     if scope is None:
         raise OddsLedgerValidationError("provider fetch does not contain a sanitized request scope")
     sport_key = getattr(scope, "sport_key", None)
@@ -414,7 +415,10 @@ def prepare_the_odds_api_payload(
     ]
     if bookmakers:
         request_scope.append(("bookmakers", ",".join(bookmakers)))
-    captured_at = max(quote.captured_at for quote in quotes)
+    # A valid empty response is still provider evidence.  With no provider
+    # quote timestamp available, bind that receipt to the local receipt time
+    # and persist it as ``accepted_empty`` rather than silently discarding it.
+    captured_at = max((quote.captured_at for quote in quotes), default=received_at)
     return PreparedOddsPayload(
         provider="the_odds_api",
         source_type=source_type,
@@ -466,8 +470,10 @@ def _validate_prepared_payload(payload: PreparedOddsPayload, *, now: datetime) -
     for value in (payload.requests_remaining, payload.requests_used, payload.request_cost):
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
             raise OddsLedgerValidationError("provider quota values must be non-negative integers or None")
-    if not isinstance(payload.quotes, tuple) or not payload.quotes:
-        raise OddsLedgerValidationError("a provider payload must contain at least one pregame quote")
+    if not isinstance(payload.quotes, tuple) or not all(
+        isinstance(quote, RawOddsQuote) for quote in payload.quotes
+    ):
+        raise OddsLedgerValidationError("a provider payload must contain a valid pregame quote collection")
     _validated_request_scope(payload.request_scope)
 
 

@@ -361,6 +361,41 @@ class OddsLedgerTests(unittest.TestCase):
         self.assertNotIn("apiKey", repr(prepared.request_scope))
         self.assertEqual(prepared.requests_remaining, 499)
 
+    def test_empty_provider_response_is_retained_as_explicit_evidence(self):
+        fetched = OddsApiFetch(
+            quotes=[],
+            requests_remaining=500,
+            requests_used=0,
+            request_cost=0,
+            skipped_live_events=0,
+            raw_payload=b"[]",
+            received_at=self.now,
+            request_scope=OddsApiRequestScope(
+                sport_key="basketball_nba",
+                regions=("us",),
+                markets=("h2h",),
+            ),
+        )
+
+        prepared = prepare_the_odds_api_payload(
+            fetched,
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+        )
+        result = self._ledger().persist(prepared, now=self.now)
+
+        self.assertEqual(prepared.captured_at, self.now)
+        self.assertEqual(result.status, "accepted_empty")
+        self.assertEqual(result.events_created, 0)
+        self.assertEqual(result.snapshots_created, 0)
+        self.assertEqual(len(self.connection.state["receipts"]), 1)
+        self.assertEqual(len(self.connection.state["provenance"]), 1)
+        self.assertEqual(self.connection.state["events"], {})
+        self.assertEqual(self.connection.state["snapshots"], {})
+        signal = json.loads(self.connection.state["signals"][-1][-1])
+        self.assertEqual(signal["status"], "accepted_empty")
+        self.assertEqual(self.store.stored_count, 1)
+
     def test_database_failure_never_commits_a_success_signal(self):
         failing_connection = _LedgerConnection(fail_on_snapshot=True)
         with self.assertRaises(OddsLedgerUnavailable) as context:

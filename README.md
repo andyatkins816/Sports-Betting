@@ -26,8 +26,11 @@ The current implementation provides:
   and CI;
 - a private, content-addressed raw-payload boundary and transactional odds
   ledger that retain corrections and provenance without exposing raw provider
-  data; the provider worker remains deliberately disabled until private object
-  storage and an approved provider contract are configured;
+  data;
+- a separate, staging-only provider-shadow worker that admits one manually
+  dispatched The Odds API request after exact license, quota, private-storage,
+  database, and broker checks; it is not scheduled, deployed, or authorized for
+  public output by source code alone;
 - a single analytical endpoint, `POST /api/v1/evaluate`, which never places a
   bet or records a fictional result.
 
@@ -58,6 +61,7 @@ Do not use that compose file as the production secret-management plan.
 - [Data, model, backtest, and risk governance](project-2/docs/DATA_AND_MODEL_GOVERNANCE.md)
 - [sam.vegas deployment runbook](project-2/docs/DEPLOYMENT_SAM_VEGAS.md)
 - [Private raw-evidence object storage](project-2/docs/RAW_EVIDENCE_OBJECT_STORAGE.md)
+- [Manual provider-shadow admission](project-2/docs/PROVIDER_SHADOW_ADMISSION.md)
 - [PostgreSQL audit schema](project-2/migrations/001_initial.sql) and
   [provider-receipt lineage migration](project-2/migrations/004_provider_payload_receipts.sql)
 

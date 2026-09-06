@@ -25,6 +25,7 @@ from sam_analytics.ingestion import RawOddsQuote
 _DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _MAX_RESPONSE_BYTES_HARD_LIMIT = 100 * 1024 * 1024
 _RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+_H2H_PROVIDER_ADDED_MARKETS = frozenset({"h2h_lay"})
 
 
 class TheOddsApiError(RuntimeError):
@@ -142,7 +143,12 @@ class TheOddsApiClient:
         if requested_bookmakers:
             params["bookmakers"] = ",".join(requested_bookmakers)
         response = self._request(f"/sports/{sport_key}/odds", params)
-        quotes, skipped = self.parse_response(response.payload, sport_key=sport_key, now=now)
+        quotes, skipped = self.parse_response(
+            response.payload,
+            sport_key=sport_key,
+            requested_markets=requested_markets,
+            now=now,
+        )
         return OddsApiFetch(
             quotes=quotes,
             requests_remaining=_header_int(response.headers, "x-requests-remaining"),
@@ -156,33 +162,64 @@ class TheOddsApiClient:
 
     @staticmethod
     def parse_response(
-        payload: Any, *, sport_key: str, now: datetime
+        payload: Any,
+        *,
+        sport_key: str,
+        requested_markets: Iterable[str],
+        now: datetime,
     ) -> tuple[list[RawOddsQuote], int]:
-        """Convert the documented v4 response shape without losing book IDs."""
+        """Convert only the requested v4 response scope without losing book IDs."""
         if not isinstance(payload, list):
             raise TheOddsApiError("provider returned an unexpected odds payload")
         if not _is_aware_datetime(now):
             raise ValueError("now must be timezone-aware")
+        requested_market_keys = tuple(requested_markets)
+        if (
+            not requested_market_keys
+            or not all(isinstance(market, str) for market in requested_market_keys)
+            or not set(requested_market_keys) <= TheOddsApiClient.supported_featured_markets
+        ):
+            raise ValueError("requested markets must be supported featured markets")
+        allowed_response_markets = set(requested_market_keys)
+        if "h2h" in allowed_response_markets:
+            # The provider can include this exchange companion market without
+            # it appearing in the request's `markets` parameter.
+            allowed_response_markets.update(_H2H_PROVIDER_ADDED_MARKETS)
+
         quotes: list[RawOddsQuote] = []
         skipped_live_events = 0
         for event in payload:
             if not isinstance(event, Mapping):
                 raise TheOddsApiError("provider event is not an object")
             event_id = _required_text(event, "id")
+            provider_sport = _required_text(event, "sport_key")
+            if provider_sport != sport_key:
+                raise TheOddsApiError("provider returned a sport that did not match the request")
+
+            # Validate every returned market key before filtering live events
+            # or parsing outcomes.  An out-of-scope empty market must not be
+            # misclassified as an admitted empty response.
+            bookmaker_markets: list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]] = []
+            for bookmaker in _required_list(event, "bookmakers"):
+                markets = _required_list(bookmaker, "markets")
+                for market in markets:
+                    if _required_text(market, "key") not in allowed_response_markets:
+                        raise TheOddsApiError(
+                            "provider returned a market that did not match the request"
+                        )
+                bookmaker_markets.append((bookmaker, markets))
+
             commence_time = _parse_provider_time(event.get("commence_time"))
             if commence_time <= now:
                 skipped_live_events += 1
                 continue
-            provider_sport = _required_text(event, "sport_key")
-            if provider_sport != sport_key:
-                raise TheOddsApiError("provider returned a sport that did not match the request")
             league = _optional_text(event, "sport_title") or provider_sport
             home_team = _required_text(event, "home_team")
             away_team = _required_text(event, "away_team")
-            for bookmaker in _required_list(event, "bookmakers"):
+            for bookmaker, markets in bookmaker_markets:
                 book_key = _required_text(bookmaker, "key")
                 book_updated = _parse_provider_time(bookmaker.get("last_update"))
-                for market in _required_list(bookmaker, "markets"):
+                for market in markets:
                     market_key = _required_text(market, "key")
                     market_updated = _parse_provider_time(market.get("last_update"), default=book_updated)
                     for outcome in _required_list(market, "outcomes"):

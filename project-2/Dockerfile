@@ -12,7 +12,7 @@ COPY migrations ./migrations
 COPY routes ./routes
 COPY templates ./templates
 COPY static ./static
-COPY app.py wsgi.py worker.py ./
+COPY app.py wsgi.py worker.py provider_worker.py ./
 RUN pip install --upgrade pip && pip install ".[modeling]"
 USER sam
 EXPOSE 8000

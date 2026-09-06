@@ -1,5 +1,10 @@
 # Private worker admission boundary
 
+This document covers only `worker.py`, the synthetic proof worker. The later
+one-request real-provider path is a separate service and boundary documented in
+[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md); neither
+worker's credentials or queue may be reused by the other.
+
 `worker.py` is deliberately **not** a general-purpose Celery entry point. This
 release admits exactly one staging-only synthetic storage probe. It does not
 authorize a provider request, odds ingestion, event settlement, model training,
@@ -35,8 +40,10 @@ restricted to `sam-raw-evidence-staging`. Cloudflare's standard permission
 bundles object listing, and its write category should be assumed to allow copy
 and deletion, even though this worker never calls those operations. Before
 creating the token, add a seven-day bucket-lock rule for `raw/synthetic/`;
-choose a time-limited TTL if the dashboard offers one and revoke it immediately
-after the one probe. Bucket-level token scope plus the prefix retention rule are
+choose a time-limited TTL if the dashboard offers one, and revoke it immediately
+after the one probe when that control is available. Otherwise, remove both
+credential values from the worker immediately and let only the shortest approved
+expiration remain. Bucket-level token scope plus the prefix retention rule are
 the security boundary because the standard R2 token cannot restrict access to
 `raw/synthetic` alone. Never include `sam-raw-evidence-prod`.
 
@@ -121,19 +128,21 @@ These controls bound one deliberate synthetic staging dispatch; they are not a
 complete production provider dispatcher, outbox, reconciliation process, or
 dead-letter system.
 
-## Still not authorized
+## Current completed proof and what remains unauthorized
 
 The private `sam-raw-evidence-staging` and `sam-raw-evidence-prod` R2 buckets
-exist with public access disabled. Both should stay empty until this release is
-merged and the staging token is placed only in a separately approved private
-worker.
+exist with public access disabled. Staging contains the verified synthetic
+object under `raw/synthetic/`; production remains empty. The synthetic worker is
+suspended, its R2 credential values were removed, and its short-lived token is
+expiring. Do not resume or repurpose that worker.
 
-Creating a Render Background Worker is a separate paid infrastructure action.
-Confirm the displayed price before creating it. Do not create a Cron Job or
-start Celery Beat.
+Creating the separate provider-shadow Render Background Worker is another paid
+infrastructure action. Confirm the displayed price and merge its reviewed code
+before creating it. Do not create a Cron Job or start Celery Beat.
 
-Real provider ingestion remains blocked until the previously exposed odds key
-is rotated, provider storage/derivation/display/redistribution rights are
-approved, retention and recovery controls are recorded, and a durable per-run
-evidence receipt, idempotent dispatch, crash reconciliation, bounded retry,
-dead-letter, alerting, worker-health, and empty-response behavior are reviewed.
+This synthetic worker remains permanently blocked from real provider
+ingestion. A separate, one-request provider-shadow path now has its own exact
+admission boundary, retention prefix, queue, settings, and operator runbook in
+[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md). That narrow
+shadow proof does not authorize scheduling, production ingestion, settlement,
+model training, or public output.

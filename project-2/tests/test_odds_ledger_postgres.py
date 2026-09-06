@@ -169,6 +169,58 @@ class OddsLedgerPostgresTests(unittest.TestCase):
                 (snapshot_count,) = cursor.fetchone()
         self.assertEqual(snapshot_count, 2)
 
+    def test_empty_provider_response_retains_receipt_and_provenance_without_snapshots(self):
+        import psycopg
+
+        payload = PreparedOddsPayload(
+            provider="the_odds_api",
+            source_type="odds",
+            raw_payload=b"[]",
+            captured_at=self.now,
+            received_at=self.now,
+            schema_version="v4",
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+            quotes=(),
+            request_scope=(
+                ("sport_key", "basketball_nba"),
+                ("regions", "us"),
+                ("markets", "h2h"),
+            ),
+            requests_remaining=500,
+            requests_used=0,
+            request_cost=0,
+        )
+
+        result = self.ledger.persist(payload, now=self.now)
+
+        self.assertEqual(result.status, "accepted_empty")
+        self.assertEqual(result.events_created, 0)
+        self.assertEqual(result.snapshots_created, 0)
+        with psycopg.connect(_DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT count(DISTINCT receipt.id),
+                           count(DISTINCT provenance.id),
+                           count(snapshot.id),
+                           signal.payload->>'status'
+                    FROM provider_payload_receipt receipt
+                    JOIN raw_data_provenance provenance
+                      ON provenance.provider_payload_receipt_id = receipt.id
+                    LEFT JOIN odds_snapshot snapshot
+                      ON snapshot.primary_provenance_id = provenance.id
+                    JOIN operational_signal signal
+                      ON signal.provenance_sha256 = provenance.provenance_sha256
+                    WHERE receipt.receipt_sha256 = %s
+                    GROUP BY signal.payload->>'status'
+                    """,
+                    (payload.receipt_sha256,),
+                )
+                row = cursor.fetchone()
+
+        self.assertEqual(row, (1, 1, 0, "accepted_empty"))
+
     def test_database_rejects_forged_provenance_bad_availability_and_event_mutation(self):
         payload = self._payload(b'{"response":1}', received_at=self.now)
         self.ledger.persist(payload, now=self.now)
