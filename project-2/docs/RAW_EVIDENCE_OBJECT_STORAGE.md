@@ -4,25 +4,27 @@ This document describes the storage boundary that must exist **before** SAM
 accepts licensed provider responses. The public `sam-api` web service never
 constructs this adapter and must not receive object-store or odds-provider
 credentials. The private worker can construct it only in the exact
-staging-only synthetic probe mode described below.
+staging-only boundaries described below. The synthetic proof uses
+`raw/synthetic/`; the separate one-request provider shadow uses
+`raw/the_odds_api/` and the additional controls in
+[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md).
 
 The private R2 buckets `sam-raw-evidence-staging` and
 `sam-raw-evidence-prod` are provisioned with Standard storage and public
-access disabled. That is only an infrastructure prerequisite, not approval to
-make a provider request. Create a staging-bucket-scoped token only after this
-private-worker release has been reviewed and merged, so it can be placed
-immediately in that worker's private secret store. Keep the production bucket
-empty and credential-free during this staging check. Before creating the token,
-add a seven-day R2 bucket-lock rule for the `raw/synthetic/` prefix in the
-staging bucket; that provider-enforced rule prevents the probe object from
-being overwritten or deleted during the review window.
+access disabled. Staging now contains the verified synthetic proof under
+`raw/synthetic/`; its worker is suspended and no longer holds its temporary R2
+credentials. Production remains empty and credential-free. That completed
+infrastructure proof is not approval to make a provider request. The separate
+provider shadow requires its reviewed code, a new staging-bucket-only token,
+and a seven-day lock on `raw/the_odds_api/` before it is created or resumed.
 
 `sam_analytics.s3_payload_store.S3CompatibleRawPayloadStore` is a concrete
 S3-compatible implementation of the `RawPayloadStore` contract. It supports
 AWS S3 and Cloudflare R2, but it has no public URL, polling loop, Flask route,
-or scheduler. This release wires it only to a fixed synthetic storage probe;
-a later reviewed change must separately wire licensed provider evidence into
-`OddsLedger` inside a private background worker.
+or scheduler. The fixed synthetic worker remains isolated from provider code.
+The separate provider-shadow worker can wire a single manually dispatched,
+licensed response into `OddsLedger` only after its independent settings and
+operational admission checks pass.
 
 ## What the adapter guarantees
 
@@ -82,7 +84,7 @@ isolated CI/local verification.
 | `SAM_RAW_EVIDENCE_S3_REGION` | `auto` |
 | `SAM_RAW_EVIDENCE_S3_ENDPOINT_URL` | Required: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`; supported jurisdiction forms are `.eu`, `.us`, and `.fedramp` |
 | `SAM_RAW_EVIDENCE_MAX_BYTES` | `1048576` (1 MiB) |
-| `SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID` / `SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY` | Required Object Read & Write R2 token pair scoped only to `sam-raw-evidence-staging`; choose a time-limited TTL if offered and revoke immediately after the probe |
+| `SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID` / `SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY` | Required Object Read & Write R2 token pair scoped only to `sam-raw-evidence-staging`; choose a time-limited TTL if offered, then revoke it when possible or remove it from the worker immediately and let only the shortest approved expiration remain |
 
 The URI is a stable identifier, not a connection URL. It must be lowercase
 `s3://`, contain a valid bucket and non-empty safe prefix, and cannot contain a
@@ -171,7 +173,9 @@ copy and deletion in the write category, so assume the issued identity can do
 all three. Restrict it to `sam-raw-evidence-staging` only, never include
 `sam-raw-evidence-prod`, choose a time-limited TTL if the dashboard offers one,
 place it only in the private worker, and revoke it immediately after the single
-manual probe. The seven-day `raw/synthetic/` bucket-lock rule is the
+manual probe when possible. If the dashboard offers no revocation control,
+remove both values from the worker immediately and require the shortest
+approved token expiration. The seven-day `raw/synthetic/` bucket-lock rule is the
 provider-enforced safeguard against overwrite or deletion during the review
 window. These controls are acceptable only for the fixed synthetic staging
 fixture; they do not approve this credential shape for licensed provider data.
@@ -187,29 +191,37 @@ SHA-256 is
 Its object write and terminal PostgreSQL audit append are separate operations.
 If the object exists while the latest audit fact is still `running`, the probe
 is inconclusive and must be reviewed manually; object presence alone is not a
-successful audit receipt. A durable per-run receipt/outbox and crash
-reconciliation remain mandatory before storing provider data.
+successful audit receipt. A direct run-to-receipt link or outbox and automated
+crash reconciliation remain mandatory before broader or scheduled provider
+ingestion; the one manual provider-shadow milestone instead requires the
+three-system reconciliation in its separate admission guide.
 
 ## Not yet authorized
 
-Do not create a paid Render Background Worker until its displayed price is
-confirmed. After this release is reviewed and merged, a staging-only R2 token
-may be created for the one manual synthetic probe, but only after the staging
-prefix's seven-day bucket-lock rule is visible in R2. It must never be placed
-in `sam-api`, Base44, GitHub, a URL, or a screenshot, and it must be revoked
-immediately after the probe is verified.
+Do not create the separate paid provider-shadow Render Background Worker until
+its displayed price is confirmed and its reviewed release is merged. A new
+staging-only R2 token may then be created for its one manual request, but only
+after the `raw/the_odds_api/` seven-day bucket-lock rule is visible in R2. It
+must never be placed in `sam-api`, the synthetic worker, Base44, GitHub, a URL,
+or a screenshot. Remove it from the worker immediately after verification and
+revoke it when possible; otherwise its shortest approved expiration is the
+remaining backstop.
 
-Do not add a provider credential or run real ingestion. That later checkpoint
-must first review:
+Do not add a provider credential to the synthetic worker or public API. One
+real-data staging request is admitted only through the separate worker and the
+preconditions in
+[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md). Any broader
+provider ingestion checkpoint must still review:
 
 - the storage provider's current retention/security settings;
 - the licensed odds provider's storage, derivation, display, and
   redistribution rights;
 - a bounded dispatcher, retry/dead-letter plan, alerts, and a worker health
   signal; and
-- a successful manual integration test against the non-production private
-  bucket with synthetic bytes only.
+- a successful one-request provider-shadow integration test against the
+  non-production private bucket with its matching raw receipt and audit.
 
-Only after that review should the replacement Odds API credential be stored in
-the private worker's secret group. It must remain absent from `sam-api`, Base44
-secrets, URL query strings, source control, logs, and screenshots.
+The replacement Odds API credential may be stored only in the separately
+admitted provider-shadow worker for that deliberate run. It must remain absent
+from the synthetic worker, `sam-api`, Base44 secrets, URL query strings, source
+control, logs, and screenshots.

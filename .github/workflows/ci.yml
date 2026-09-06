@@ -58,7 +58,7 @@ jobs:
         # E501 is deliberately ignored in pyproject.toml. Passing --select
         # on the command line otherwise re-enables it, which makes the CI
         # rule differ from the documented local policy.
-        run: ruff check --select E,F --ignore E501 sam_analytics routes/api.py app.py worker.py
+        run: ruff check --select E,F --ignore E501 sam_analytics routes/api.py app.py worker.py provider_worker.py
       - name: Test
         working-directory: project-2
         # `python -m` preserves this application directory on the import
@@ -70,7 +70,7 @@ jobs:
         run: python -m pytest
       - name: Security scan
         working-directory: project-2
-        run: bandit -q -r sam_analytics routes app.py worker.py
+        run: bandit -q -r sam_analytics routes app.py worker.py provider_worker.py
       - name: Validate opt-in worker Compose profile
         run: |
           cp .env.example .env
@@ -110,6 +110,47 @@ jobs:
             sleep 1
           done
           docker logs sam-worker-ci
+          exit 1
+      - name: Smoke-test provider-shadow worker container
+        run: |
+          trap 'docker rm -f sam-provider-worker-ci >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name sam-provider-worker-ci --network host \
+            --add-host red-sam-test:127.0.0.1 \
+            --env APP_ENV=staging \
+            --env DATABASE_URL=postgresql://sam:sam-ci-password@dpg-sam-test-a/sam \
+            --env REDIS_URL=redis://red-sam-test:6379/0 \
+            --env SAM_WORKER_ROLE=private_ingestion \
+            --env SAM_WORKER_MODE=provider_shadow \
+            --env SAM_INGESTION_ENABLED=true \
+            --env ODDS_PROVIDER=the_odds_api \
+            --env ODDS_PROVIDER_API_KEY=ci-provider-key \
+            --env SAM_ODDS_SPORT_KEY=baseball_mlb \
+            --env SAM_ODDS_REGIONS=us \
+            --env SAM_ODDS_MARKETS=h2h \
+            --env SAM_PROVIDER_LICENSE_SCOPE=internal_analytics_only \
+            --env SAM_PROVIDER_LICENSE_VERSION=terms-2026-08-31 \
+            --env SAM_RAW_EVIDENCE_STORE_BACKEND=cloudflare_r2 \
+            --env SAM_RAW_EVIDENCE_STORE_URI=s3://sam-raw-evidence-staging/raw/the_odds_api \
+            --env SAM_RAW_EVIDENCE_S3_REGION=auto \
+            --env SAM_RAW_EVIDENCE_S3_ENDPOINT_URL=https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com \
+            --env SAM_RAW_EVIDENCE_MAX_BYTES=10485760 \
+            --env SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID=ci-scoped-r2-access-id \
+            --env SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY=ci-scoped-r2-secret \
+            sam-analytics:${{ github.sha }} \
+            celery -A provider_worker:celery_app worker --loglevel=INFO --concurrency=1 \
+              --queues=sam_provider_shadow --without-gossip --without-mingle
+          for attempt in $(seq 1 30); do
+            if docker logs sam-provider-worker-ci 2>&1 | grep -q ' ready\.'; then
+              test "$(docker inspect --format '{{.State.Running}}' sam-provider-worker-ci)" = true
+              exit 0
+            fi
+            if test "$(docker inspect --format '{{.State.Running}}' sam-provider-worker-ci)" != true; then
+              docker logs sam-provider-worker-ci
+              exit 1
+            fi
+            sleep 1
+          done
+          docker logs sam-provider-worker-ci
           exit 1
       - name: Smoke-test container
         run: |

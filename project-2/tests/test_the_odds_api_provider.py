@@ -36,7 +36,10 @@ class TheOddsApiProviderTests(unittest.TestCase):
 
     def test_parser_preserves_event_market_selection_and_provider_time(self):
         quotes, skipped = TheOddsApiClient.parse_response(
-            self.payload, sport_key="basketball_nba", now=self.now
+            self.payload,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
         )
         self.assertEqual(skipped, 0)
         self.assertEqual(len(quotes), 2)
@@ -51,15 +54,24 @@ class TheOddsApiProviderTests(unittest.TestCase):
 
     def test_quote_identity_changes_when_provider_corrects_price_or_line(self):
         original, _ = TheOddsApiClient.parse_response(
-            self.payload, sport_key="basketball_nba", now=self.now
+            self.payload,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
         )
         price_correction = _payload_with_outcome(self.payload, price=-105)
         line_correction = _payload_with_outcome(self.payload, point=-1.5)
         corrected_price, _ = TheOddsApiClient.parse_response(
-            price_correction, sport_key="basketball_nba", now=self.now
+            price_correction,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
         )
         corrected_line, _ = TheOddsApiClient.parse_response(
-            line_correction, sport_key="basketball_nba", now=self.now
+            line_correction,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
         )
         self.assertNotEqual(original[0].provider_quote_id, corrected_price[0].provider_quote_id)
         self.assertNotEqual(original[0].provider_quote_id, corrected_line[0].provider_quote_id)
@@ -282,19 +294,74 @@ class TheOddsApiProviderTests(unittest.TestCase):
             client.fetch_pregame_odds("basketball_nba", regions="us,https://elsewhere.invalid")
         invalid_payload = _payload_with_outcome(self.payload, price=float("nan"))
         with self.assertRaisesRegex(TheOddsApiError, "invalid American odds"):
-            TheOddsApiClient.parse_response(invalid_payload, sport_key="basketball_nba", now=self.now)
+            TheOddsApiClient.parse_response(
+                invalid_payload,
+                sport_key="basketball_nba",
+                requested_markets=("h2h",),
+                now=self.now,
+            )
 
     def test_parser_filters_live_events_instead_of_relabeling_them_pregame(self):
         self.payload[0]["commence_time"] = (self.now - timedelta(seconds=1)).isoformat()
         quotes, skipped = TheOddsApiClient.parse_response(
-            self.payload, sport_key="basketball_nba", now=self.now
+            self.payload,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
         )
         self.assertEqual(quotes, [])
         self.assertEqual(skipped, 1)
 
     def test_parser_rejects_sport_mismatch(self):
         with self.assertRaises(TheOddsApiError):
-            TheOddsApiClient.parse_response(self.payload, sport_key="baseball_mlb", now=self.now)
+            TheOddsApiClient.parse_response(
+                self.payload,
+                sport_key="baseball_mlb",
+                requested_markets=("h2h",),
+                now=self.now,
+            )
+
+    def test_parser_validates_scope_before_live_filter_or_empty_outcomes(self):
+        import copy
+
+        live_wrong_sport = copy.deepcopy(self.payload)
+        live_wrong_sport[0]["commence_time"] = (
+            self.now - timedelta(seconds=1)
+        ).isoformat()
+        with self.assertRaisesRegex(TheOddsApiError, "sport.*did not match"):
+            TheOddsApiClient.parse_response(
+                live_wrong_sport,
+                sport_key="baseball_mlb",
+                requested_markets=("h2h",),
+                now=self.now,
+            )
+
+        empty_wrong_market = copy.deepcopy(self.payload)
+        empty_wrong_market[0]["bookmakers"][0]["markets"][0]["key"] = "spreads"
+        empty_wrong_market[0]["bookmakers"][0]["markets"][0]["outcomes"] = []
+        with self.assertRaisesRegex(TheOddsApiError, "market.*did not match"):
+            TheOddsApiClient.parse_response(
+                empty_wrong_market,
+                sport_key="basketball_nba",
+                requested_markets=("h2h",),
+                now=self.now,
+            )
+
+    def test_parser_admits_documented_h2h_lay_as_a_provider_added_companion(self):
+        import copy
+
+        provider_added = copy.deepcopy(self.payload)
+        provider_added[0]["bookmakers"][0]["markets"][0]["key"] = "h2h_lay"
+
+        quotes, skipped = TheOddsApiClient.parse_response(
+            provider_added,
+            sport_key="basketball_nba",
+            requested_markets=("h2h",),
+            now=self.now,
+        )
+
+        self.assertEqual(skipped, 0)
+        self.assertEqual({quote.market for quote in quotes}, {"h2h_lay"})
 
     def test_client_rejects_unpinned_or_non_https_provider_endpoint(self):
         class UnsafeClient(TheOddsApiClient):

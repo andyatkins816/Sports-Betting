@@ -6,18 +6,18 @@ SAM is a lawful, research-only sports-market analytics service. It does not
 place wagers, promise profitability, or publish predictions merely because a
 website is online.
 
-This is the current staging snapshot, checked 2026-09-04:
+This is the current staging snapshot, checked 2026-09-05:
 
 | Component | Current state | Important limit |
 | --- | --- | --- |
 | `sam-api` | Deployed as a Render Docker web service in Oregon; `/api/healthz` and `/api/readyz` passed. | Readiness proves Postgres migrations and Key Value connectivity, not that data or a model is ready. |
 | `sam-postgres` | Private Render Postgres in Oregon, connected through `DATABASE_URL`; reviewed migrations run before deploy. | No real provider observations or model facts have been written yet. |
-| `sam-key-value` | Private Render Key Value (Valkey) in Oregon, connected through `REDIS_URL`. | It is available for future queue/cache work; no worker consumes it yet. |
+| `sam-key-value` | Private Render Key Value (Valkey) in Oregon, connected through `REDIS_URL`. | It backed the successful synthetic worker proof and remains private. |
 | Application environment | `APP_ENV=staging`. | Render's visible project grouping named “Production” is a UI label, not permission to treat SAM as production. |
 | `sam.vegas` | Base44 is the public experience and evidence/governance UI. | Do not point the apex domain at the Python API. |
 | `api.sam.vegas` | Reserved for the Render API custom domain. | Do not configure DNS or Base44's production status URL until Render domain validation is ready. |
-| Raw evidence storage | Private Cloudflare R2 buckets `sam-raw-evidence-staging` and `sam-raw-evidence-prod` are provisioned with Standard storage and public access disabled. | Both are intentionally empty. After the staging-probe release is merged, only the staging bucket may receive a scoped synthetic-test token. |
-| Worker, scheduler, odds/results ingestion | Not live. The code admits one manual synthetic staging probe only. | No Odds API polling, scheduled work, model training, or prediction delivery is authorized. |
+| Raw evidence storage | Private Cloudflare R2 buckets `sam-raw-evidence-staging` and `sam-raw-evidence-prod` are provisioned with Standard storage and public access disabled. | Staging contains the verified content-addressed synthetic proof under `raw/synthetic/`; production remains empty. The temporary token is no longer attached to the worker and has a short expiration. |
+| Workers and ingestion | `sam-synthetic-worker` completed its one audited proof and is suspended. A separate one-request provider-shadow worker is implemented but not yet admitted operationally. | No scheduled polling, results ingestion, model training, or prediction delivery is authorized. |
 
 The desired topology is deliberately simple:
 
@@ -57,8 +57,9 @@ invent an odds feed, prediction, edge, or performance claim.
 
 - The API's database migrations and dependency-readiness checks are live, but
   the new immutable odds repository is not yet activated in a worker.
-- Key Value and private R2 buckets exist, but there is no deployed worker or
-  scheduler and no storage token has been created.
+- The synthetic worker is suspended after its successful proof. The separate
+  provider-shadow worker is not deployed, has no provider key, and has no
+  storage token; no scheduler exists.
 - No licensed odds/results pipeline is polling, no model artifact is approved,
   and no public prediction delivery is enabled.
 - Base44 is not yet connected to the Python status endpoint with its separate
@@ -135,7 +136,7 @@ store. A secret belongs in exactly the service that needs it.
 | `DATABASE_URL` | Render `sam-api` and future worker | Use Render's internal Postgres connection string, not an external URL. The current readiness endpoint checks it without revealing it. |
 | `REDIS_URL` | Render `sam-api` and future worker | Use only the private/internal Key Value connection string. The current readiness endpoint checks it without revealing it. |
 | `ODDS_PROVIDER_API_KEY` | Future private worker only | Rotate the previously exposed key first. Never add it to the web API, Base44, browser, GitHub, or logs. Staging/production `sam-api` refuses to start if this or a results-provider key is present. |
-| object-storage credentials | Future private worker only | Use the smallest provider-supported identity. For this R2 probe, scope the standard Object Read & Write token only to `sam-raw-evidence-staging`, choose a time-limited TTL if offered, add the required prefix lock, and revoke it immediately afterward. Staging/production `sam-api` refuses to start if worker-only settings or credentials are present. |
+| object-storage credentials | Future private worker only | Use the smallest provider-supported identity. For an R2 probe, scope the standard Object Read & Write token only to `sam-raw-evidence-staging`, choose a time-limited TTL, add the required prefix lock, and remove its values from the worker immediately afterward; revoke it when that control is available. Staging/production `sam-api` refuses to start if worker-only settings or credentials are present. |
 
 Never use a URL query parameter for a secret. Never expose secrets through an
 API response, Base44 entity, client-side JavaScript, logs, screenshots, or an
@@ -171,23 +172,25 @@ Use an S3-compatible provider selected for the applicable data-license and
 retention requirements. Store only the data the provider contract permits SAM
 to retain.
 
-The repository now includes a concrete AWS S3 / Cloudflare R2 adapter. It is
-wired only to a fixed synthetic probe behind an exact staging admission guard;
-it is not wired to a provider or `OddsLedger`. The dedicated staging and
-production R2 buckets are provisioned. Follow the exact credential, bucket,
-endpoint, provider-specific credential limits, and compensating controls in
-[private raw-evidence object storage](RAW_EVIDENCE_OBJECT_STORAGE.md) before
-the private worker constructs the adapter.
+The repository includes a concrete AWS S3 / Cloudflare R2 adapter. The
+synthetic worker uses it only for its fixed proof. A separate, manual-only
+provider-shadow worker can pass one licensed response through `OddsLedger`
+under a different exact prefix and admission guard. The dedicated staging and
+production R2 buckets are provisioned. Follow
+[private raw-evidence object storage](RAW_EVIDENCE_OBJECT_STORAGE.md) and the
+[manual provider-shadow admission guide](PROVIDER_SHADOW_ADMISSION.md) before
+the provider worker constructs the adapter.
 
 - Keep the bucket private; block anonymous listing and public object reads.
 - Leave `sam-raw-evidence-prod` empty and credential-free while the application
-  is staging. Use only `sam-raw-evidence-staging/raw/synthetic` for the fixed
-  integration fixture after the worker release is reviewed and merged.
-- Before creating the staging token, add a seven-day R2 bucket-lock rule for
-  `raw/synthetic/`. Cloudflare's standard Object Read & Write token grants
-  listing and should be assumed to permit copy/delete, so restrict it to the
-  staging bucket, choose a time-limited TTL if offered, and revoke it
-  immediately after the probe.
+  is staging. The fixed synthetic proof already exists under
+  `sam-raw-evidence-staging/raw/synthetic`; its temporary credentials were
+  removed from the suspended worker and the short-lived token is expiring.
+- Before the one provider-shadow request, add a separate seven-day R2
+  bucket-lock rule for `raw/the_odds_api/` and create a new staging-bucket-only
+  token. Remove it from the worker immediately after the three-system
+  verification and revoke it when possible; otherwise rely only on its shortest
+  approved expiration.
 - Encrypt data at rest and in transit; enable versioning or write-once evidence
   controls where available.
 - Separate raw provider payloads, model artifacts, and reports by restricted
@@ -195,39 +198,27 @@ the private worker constructs the adapter.
 - Store provider responses, feature snapshots, model artifacts, calibration
   reports, and backups only after their contracts and retention rules are
   documented.
-- Give the public API no object-storage credentials. The future worker should
-  receive the smallest provider-supported scope, with separately enforced
+- Give the public API no object-storage credentials. Each private worker
+  receives its own smallest provider-supported scope, with separately enforced
   retention when the provider bundles authority the adapter does not use.
 
-### Stage 4 — verify the private worker manually
+### Stage 4 — verify each private worker manually
 
-Use the same reviewed container image in a Render Background Worker or private
-job, never as a public web route. The worker command will be:
+The synthetic storage proof completed successfully across Render, R2, and
+PostgreSQL. Its worker is suspended, its temporary R2 credentials were removed,
+and the short-lived token is expiring. Keep it that way; it never receives a
+provider credential.
 
-```text
-celery -A worker:celery_app worker --loglevel=INFO --concurrency=1 --queues=sam_manual_shadow --without-gossip --without-mingle
-```
+The next checkpoint is one request through the separate provider-shadow
+worker. Follow
+[manual provider-shadow admission](PROVIDER_SHADOW_ADMISSION.md) exactly. Its
+queue, environment, R2 prefix/token, task name, and worker service must remain
+separate from the synthetic worker. Do not start Celery Beat, create a Cron
+Job, enable automatic deploys, or infer success from a Render `Live` badge.
 
-Do not start Celery Beat or create a Cron Job. This release permits one
-zero-argument synthetic storage task only, dispatched deliberately after the
-worker and its staging-only secret group have been reviewed. Automatic retry,
-worker-lost redelivery, and missing-queue creation are disabled.
-
-From a separate process with that same reviewed worker environment, the only
-admitted manual publish command is:
-
-```text
-celery -A worker:celery_app call sam_analytics.verify_staging_raw_evidence
-```
-
-The probe is intentionally at-most-once. A crash can leave no audit row or a
-latest `queued`/`running` fact, and a verified fixed object can exist before a
-terminal database append. Treat that as inconclusive, inspect both private
-systems, and publish a new generated task only after review; do not rely on
-automatic redelivery.
-
-Before starting a real provider worker or any scheduler, implement and test
-all of the following:
+That single shadow proof is still not a general provider dispatcher. Before
+starting scheduled or production ingestion, implement and test all of the
+following:
 
 - transactional Postgres persistence and source-received timestamps;
 - idempotency keys and a dead-letter/review path;
@@ -236,8 +227,8 @@ all of the following:
 - rate limits that respect the provider agreement and quota;
 - alerts for failures, queue depth, stalled jobs, stale data, and quota loss.
 
-The current worker deliberately cannot poll, settle, or train. Its synthetic
-probe writes no odds facts. This is a safety feature, not an outage.
+Neither manual worker can settle, train, publish predictions, or place wagers.
+This is a safety boundary, not an outage.
 
 ### Stage 5 — provider onboarding and model governance
 
