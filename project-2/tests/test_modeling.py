@@ -3,29 +3,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-from sam_analytics.modeling import (
-    adapt_labeled_training_examples,
-    CandidateScore,
-    CrossFittedCalibration,
-    FeatureSchema,
-    FittedProbabilityModel,
-    ModelDataError,
-    ModelCandidate,
-    NumericFeature,
-    OptionalModelDependencyError,
-    OOFProbability,
-    OutcomeTrainingRow,
-    PredictionInput,
-    ProbabilityMetrics,
-    ProbabilityModelEvaluator,
-    PromotionPolicy,
-    RollingTimeSplitter,
-    build_estimator,
-    cross_fit_isotonic_calibration,
-    default_model_candidates,
-    evaluate_promotion,
-    validate_prediction_input,
-)
 from sam_analytics.data_contracts import (
     FeatureContract,
     FeatureDefinition,
@@ -33,6 +10,31 @@ from sam_analytics.data_contracts import (
     LabeledTrainingExample,
     PointInTimeFeatureVector,
     RawDataProvenance,
+)
+from sam_analytics.modeling import (
+    PREGAME_H2H_FEATURE_SCHEMA,
+    CandidateScore,
+    CrossFittedCalibration,
+    FeatureSchema,
+    FittedProbabilityModel,
+    ModelCandidate,
+    ModelDataError,
+    NumericFeature,
+    OOFProbability,
+    OptionalModelDependencyError,
+    OutcomeTrainingRow,
+    PredictionInput,
+    ProbabilityMetrics,
+    ProbabilityModelEvaluator,
+    PromotionPolicy,
+    RollingTimeSplitter,
+    adapt_labeled_training_examples,
+    build_estimator,
+    build_h2h_market_training_rows,
+    cross_fit_isotonic_calibration,
+    default_model_candidates,
+    evaluate_promotion,
+    validate_prediction_input,
 )
 
 
@@ -67,6 +69,165 @@ class ModelingContractTests(unittest.TestCase):
                 )
             )
         return rows
+
+    def _market_records(
+        self,
+        *,
+        event_id="market-event",
+        starts_at=None,
+        result_id="result-1",
+        result_received_at=None,
+        settled_at=None,
+        home_score=101,
+        away_score=99,
+    ):
+        starts_at = starts_at or self.start + timedelta(hours=2)
+        result_received_at = result_received_at or starts_at + timedelta(hours=1)
+        settled_at = settled_at or starts_at + timedelta(minutes=50)
+        rows = []
+        prices = {
+            "book-a": {"Home": 2.0, "Away": 2.0},
+            "book-b": {"Home": 2.2, "Away": 1.8},
+        }
+        for bookmaker, selections in prices.items():
+            for selection, decimal_odds in selections.items():
+                rows.append(
+                    {
+                        "event_id": event_id,
+                        "sport": "basketball_nba",
+                        "starts_at": starts_at,
+                        "home_team": "Home",
+                        "away_team": "Away",
+                        "odds_snapshot_id": f"{event_id}-{bookmaker}-{selection}",
+                        "bookmaker": bookmaker,
+                        "primary_provenance_id": f"{event_id}-{bookmaker}-batch",
+                        "market": "h2h",
+                        "selection": selection,
+                        "decimal_odds": decimal_odds,
+                        "captured_at": starts_at - timedelta(hours=1, minutes=1),
+                        "quote_received_at": starts_at - timedelta(hours=1),
+                        "result_id": result_id,
+                        "settled_at": settled_at,
+                        "result_received_at": result_received_at,
+                        "home_score": home_score,
+                        "away_score": away_score,
+                    }
+                )
+        return rows
+
+    def test_persisted_market_rows_are_point_in_time_coherent_and_provenance_bound(self):
+        starts_at = self.start + timedelta(hours=2)
+        records = self._market_records(starts_at=starts_at)
+        records.extend(
+            [
+                {
+                    **records[0],
+                    "odds_snapshot_id": "too-late-home",
+                    "primary_provenance_id": "too-late-batch",
+                    "captured_at": starts_at - timedelta(minutes=20),
+                    "quote_received_at": starts_at - timedelta(minutes=20),
+                },
+                {
+                    **records[1],
+                    "odds_snapshot_id": "too-late-away",
+                    "primary_provenance_id": "too-late-batch",
+                    "captured_at": starts_at - timedelta(minutes=20),
+                    "quote_received_at": starts_at - timedelta(minutes=20),
+                },
+                {
+                    **records[0],
+                    "bookmaker": "incomplete-book",
+                    "odds_snapshot_id": "incomplete-home",
+                    "primary_provenance_id": "incomplete-batch",
+                },
+                {
+                    **records[0],
+                    "bookmaker": "missing-lineage-book",
+                    "odds_snapshot_id": "missing-lineage-home",
+                    "primary_provenance_id": None,
+                },
+            ]
+        )
+
+        rows = build_h2h_market_training_rows(
+            reversed(records),
+            sport="basketball_nba",
+            training_cutoff=starts_at + timedelta(hours=2),
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.decision_at, starts_at - timedelta(minutes=30))
+        self.assertEqual(row.features_available_at, starts_at - timedelta(hours=1))
+        self.assertAlmostEqual(row.features["market_probability"], 0.475)
+        self.assertEqual(
+            row.source_snapshot_ids,
+            tuple(
+                sorted(
+                    {
+                        "market-event-book-a-Home",
+                        "market-event-book-a-Away",
+                        "market-event-book-b-Home",
+                        "market-event-book-b-Away",
+                    }
+                )
+            ),
+        )
+        self.assertEqual(row.label_source_snapshot_id, "result-1")
+        self.assertEqual(PREGAME_H2H_FEATURE_SCHEMA.vector(row.features), (0.475,))
+
+    def test_persisted_market_rows_use_latest_result_known_at_cutoff(self):
+        starts_at = self.start + timedelta(hours=2)
+        old_received = starts_at + timedelta(hours=1)
+        old_rows = self._market_records(
+            starts_at=starts_at,
+            result_id="old-result",
+            result_received_at=old_received,
+            settled_at=starts_at + timedelta(minutes=50),
+            home_score=101,
+        )
+        correction_received = starts_at + timedelta(hours=2)
+        corrected = {
+            **old_rows[0],
+            "result_id": "corrected-result",
+            "result_received_at": correction_received,
+            "settled_at": starts_at + timedelta(hours=1, minutes=50),
+            "home_score": 98,
+        }
+
+        before = build_h2h_market_training_rows(
+            old_rows + [corrected],
+            sport="basketball_nba",
+            training_cutoff=correction_received - timedelta(seconds=1),
+        )
+        after = build_h2h_market_training_rows(
+            old_rows + [corrected],
+            sport="basketball_nba",
+            training_cutoff=correction_received,
+        )
+
+        self.assertEqual((before[0].outcome, before[0].label_source_snapshot_id), (1, "old-result"))
+        self.assertEqual((after[0].outcome, after[0].label_source_snapshot_id), (0, "corrected-result"))
+
+    def test_persisted_market_rows_exclude_ties_and_sort_chronologically(self):
+        later_start = self.start + timedelta(hours=5)
+        earlier_start = self.start + timedelta(hours=2)
+        later = self._market_records(event_id="later", starts_at=later_start)
+        earlier = self._market_records(event_id="earlier", starts_at=earlier_start)
+        tied = self._market_records(
+            event_id="tie",
+            starts_at=self.start + timedelta(hours=3),
+            home_score=100,
+            away_score=100,
+        )
+
+        rows = build_h2h_market_training_rows(
+            later + tied + earlier,
+            sport="basketball_nba",
+            training_cutoff=self.start + timedelta(hours=8),
+        )
+
+        self.assertEqual([row.event_id for row in rows], ["earlier", "later"])
 
     def test_feature_contract_rejects_future_and_unknown_inputs(self):
         request = PredictionInput(

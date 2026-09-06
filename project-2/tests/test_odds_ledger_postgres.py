@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
+from sam_analytics.modeling import load_h2h_market_training_rows
 from sam_analytics.odds_ledger import OddsLedger, PreparedOddsPayload, PreparedResultsPayload
 from sam_analytics.provider_contracts import ApprovedProviderContract, ProviderContractRegistry
 from sam_analytics.providers.the_odds_api import CompletedScore
@@ -253,6 +254,73 @@ class OddsLedgerPostgresTests(unittest.TestCase):
         self.assertEqual(result_count, 2)
         self.assertEqual(provenance_count, 2)
         self.assertEqual(home_scores, [101, 102])
+
+    def test_persisted_odds_and_result_become_a_model_training_row(self):
+        starts_at = self.now - timedelta(hours=3)
+        captured_at = starts_at - timedelta(hours=1)
+        quotes = []
+        prices = {
+            "book-a": {"Home": -100.0, "Away": -100.0},
+            "book-b": {"Home": 120.0, "Away": -125.0},
+        }
+        for bookmaker, selections in prices.items():
+            for selection, american_odds in selections.items():
+                quotes.append(
+                    RawOddsQuote(
+                        provider="the_odds_api",
+                        provider_quote_id=f"{self.event_id}-{bookmaker}-{selection}",
+                        event_id=self.event_id,
+                        sport="basketball_nba",
+                        market="h2h",
+                        selection=selection,
+                        american_odds=american_odds,
+                        line=None,
+                        captured_at=captured_at,
+                        starts_at=starts_at,
+                        bookmaker=bookmaker,
+                        league="NBA",
+                        home_team="Home",
+                        away_team="Away",
+                    )
+                )
+        odds_payload = PreparedOddsPayload(
+            provider="the_odds_api",
+            source_type="odds",
+            raw_payload=b'{"historical":"odds"}',
+            captured_at=captured_at,
+            received_at=captured_at,
+            schema_version="v4",
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+            quotes=tuple(quotes),
+            request_scope=(("sport_key", "basketball_nba"), ("regions", "us"), ("markets", "h2h")),
+            requests_remaining=499,
+            requests_used=1,
+            request_cost=1,
+        )
+        odds_write = self.ledger.persist(odds_payload, now=captured_at)
+        result_write = self.ledger.persist_results(
+            self._results_payload(
+                b'{"historical":"result"}',
+                received_at=self.now,
+                last_update=self.now - timedelta(seconds=10),
+                home_score=101,
+            ),
+            now=self.now,
+        )
+
+        rows = load_h2h_market_training_rows(
+            _DATABASE_URL,
+            sport="basketball_nba",
+            training_cutoff=self.now + timedelta(seconds=1),
+        )
+        row = next(item for item in rows if item.event_id and item.label_source_snapshot_id)
+
+        self.assertEqual(odds_write.snapshots_created, 4)
+        self.assertEqual(result_write.results_created, 1)
+        self.assertEqual(row.outcome, 1)
+        self.assertAlmostEqual(row.features["market_probability"], 0.475)
+        self.assertEqual(len(row.source_snapshot_ids), 4)
 
     def test_empty_provider_response_retains_receipt_and_provenance_without_snapshots(self):
         import psycopg
