@@ -224,15 +224,28 @@ defines deterministic idempotency, quota/spacing/batch admission, bounded
 retry/dead-letter decisions, append-only transactional dispatch facts, and a
 sanitized monitoring projection. Its unwired repository can atomically persist
 only pending intent bound to an exact reviewed-use record and quota receipt.
-The reviewed-use table is empty, so the repository fails closed. It remains
-disabled and made no additional provider request or schedule.
+The next inactive layer adds an append-only outbox publication and attempt
+ledger, narrow PostgreSQL functions, and a broker-neutral runtime. It commits
+`running` before a provider callback could execute, never automatically repeats
+an ambiguous in-flight call, permits retry only when the adapter proves no
+request was sent, snapshots the exact retry schedule by digest, and binds
+completion to the exact authorization and receipt. The reviewed-use table is
+empty, and no broker adapter, provider
+callback, credential loader, task registration, or scheduler is wired, so the
+repository still fails closed and made no additional provider request.
 
 Before starting scheduled or production ingestion, finish and test all of the
 following:
 
-- an idempotent outbox publisher and consumer that append their state before
-  any provider request;
-- append-only authorization revocation and quota-reservation reconciliation;
+- reviewed broker-specific publisher/consumer composition, a function-only
+  runtime database role, and a trusted receipt-insert routine;
+- a final database execution fence with fresh quota/spacing/authorization/
+  revocation checks, an absolute provider-call deadline, and enforced timeout;
+- append-only authorization revocation, a bounded reauthorization cadence,
+  exact quota-pool identity, fenced crash recovery, and quota reconciliation;
+- atomic dead-letter fallback when a retry can no longer reserve quota;
+- staging concurrency, redelivery, pause/resume, and crash-boundary tests around
+  the inactive outbox runtime;
 - a results-provider contract and settlement reconciliation;
 - a trusted database adapter that supplies the new ingestion-health contract;
 - production-reviewed rate limits that respect the provider agreement and

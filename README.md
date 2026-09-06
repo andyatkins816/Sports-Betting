@@ -33,9 +33,10 @@ The current implementation provides:
   worker is now suspended and credential-free;
 - an inactive ingestion control-plane foundation with deterministic
   idempotency, quota reservations, request spacing, bounded retries,
-  dead-letter decisions, an append-only transactional outbox schema, and a
-  sanitized fail-closed health projection; no scheduler or production worker
-  is wired to it;
+  dead-letter decisions, an append-only transactional outbox, and an unwired
+  broker-neutral publisher/consumer runtime whose database-owned claims prevent
+  ambiguous worker redelivery from repeating a provider call; no scheduler,
+  credential loader, broker adapter, or production worker is wired to it;
 - a single analytical endpoint, `POST /api/v1/evaluate`, which never places a
   bet or records a fictional result.
 

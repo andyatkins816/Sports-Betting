@@ -35,10 +35,14 @@ geography, service-level support, and termination/deletion requirements.
 One provider adapter must own its schema translation. The included The Odds API
 v4 adapter covers featured pregame markets only, preserves the provider event/
 book/market/selection structure, filters in-play events, and returns quota
-headers. The unwired admission repository can persist pending intent but cannot
-publish or run it. The adapter is intentionally not scheduled until the
-publisher, consumer, authorization-revocation check, and data-quality incident
-writer are reviewed and connected. Every adapter should:
+headers. The admission repository can persist pending intent, and the unwired
+runtime can coordinate durable, broker-neutral publication and one claimed
+attempt without constructing a broker or provider client. Its database contract
+permits duplicate broker delivery but never automatically reclaims an ambiguous
+provider attempt. The adapter is intentionally not scheduled until a reviewed
+broker/provider composition, authorization-revocation check immediately before
+every attempt, database-derived execution deadline/fence, and data-quality
+incident writer are connected. Every adapter should:
 
 1. Pull with timeouts, retry only idempotent requests using exponential backoff,
    honor `Retry-After`, and emit remaining quota from response headers.

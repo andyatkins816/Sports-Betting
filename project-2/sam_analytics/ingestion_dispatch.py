@@ -37,6 +37,7 @@ _MAX_BATCH_SIZE = 10
 _MAX_ATTEMPTS = 5
 _MAX_POLICY_DURATION = timedelta(days=7)
 DISPATCH_IDEMPOTENCY_SCHEME = "sam-ingestion-dispatch-v1"
+RETRY_SCHEDULE_FINGERPRINT_SCHEME = "sam-ingestion-retry-schedule-v1"
 
 
 class DispatchValidationError(ValueError):
@@ -159,6 +160,23 @@ class DispatchPolicy:
         _validate_duration(self.max_retry_delay, label="maximum retry delay")
         if any(delay > self.max_retry_delay for delay in self.retry_delays):
             raise DispatchValidationError("retry delay exceeds the maximum retry delay")
+
+
+def retry_schedule_sha256(policy: DispatchPolicy) -> str:
+    """Return an exact digest of the retry inputs consumed after admission."""
+
+    if not isinstance(policy, DispatchPolicy):
+        raise DispatchValidationError("dispatch policy is required")
+    components = [
+        RETRY_SCHEDULE_FINGERPRINT_SCHEME,
+        f"max_retry_delay_us={_timedelta_microseconds(policy.max_retry_delay)}",
+        f"retry_delay_count={len(policy.retry_delays)}",
+    ]
+    components.extend(
+        f"retry_delay_{index}_us={_timedelta_microseconds(delay)}"
+        for index, delay in enumerate(policy.retry_delays)
+    )
+    return hashlib.sha256("\n".join(components).encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -694,6 +712,13 @@ def _validate_retry_after(value: object) -> None:
 def _validate_aware_time(value: object, label: str) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise DispatchValidationError(f"{label} must be timezone-aware")
+
+
+def _timedelta_microseconds(value: timedelta) -> int:
+    return (
+        (value.days * 86_400 + value.seconds) * 1_000_000
+        + value.microseconds
+    )
 
 
 def _utc_text(value: datetime) -> str:

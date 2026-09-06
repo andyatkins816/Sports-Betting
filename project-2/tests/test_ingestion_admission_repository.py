@@ -8,7 +8,7 @@ from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sam_analytics.ingestion_admission_repository import (
     IngestionAdmissionRepositoryConflict,
@@ -20,6 +20,7 @@ from sam_analytics.ingestion_dispatch import (
     DispatchCandidate,
     DispatchPolicy,
     DispatchValidationError,
+    retry_schedule_sha256,
 )
 from sam_analytics.provider_contracts import ProviderUse
 
@@ -294,6 +295,7 @@ class IngestionAdmissionRepositoryTests(unittest.TestCase):
             transition = self.database.writes[index + 3][1]
             self.assertEqual(dispatch[9], self.now)
             self.assertEqual(dispatch[11], self.database.authorization_id)
+            self.assertEqual(dispatch[15], retry_schedule_sha256(self.policy))
             self.assertEqual(reservation[0], dispatch[0])
             self.assertEqual(reservation[2], self.now)
             self.assertEqual(reservation[3], self.database.quota_receipt_id)
@@ -372,6 +374,40 @@ class IngestionAdmissionRepositoryTests(unittest.TestCase):
             "an effective provider use authorization is not available",
         )
         self.assertNotIn(self.database_url, str(caught.exception))
+        self.assertEqual(self.database.writes, [])
+
+    def test_zero_authorization_id_is_rejected_before_any_write(self) -> None:
+        self.database.authorization = (UUID(int=0), "a" * 64)
+
+        with self.assertRaisesRegex(
+            IngestionAdmissionRepositoryUnavailable,
+            "stored provider use authorization is invalid",
+        ):
+            self.repository.admit(
+                [self._candidate()],
+                policy=self.policy,
+                provider_use=self.provider_use,
+            )
+
+        self.assertEqual(self.database.writes, [])
+
+    def test_zero_quota_receipt_id_is_rejected_before_any_write(self) -> None:
+        self.database.quota_receipt = (
+            UUID(int=0),
+            10,
+            self.now - timedelta(minutes=1),
+        )
+
+        with self.assertRaisesRegex(
+            IngestionAdmissionRepositoryUnavailable,
+            "stored provider quota observation is invalid",
+        ):
+            self.repository.admit(
+                [self._candidate()],
+                policy=self.policy,
+                provider_use=self.provider_use,
+            )
+
         self.assertEqual(self.database.writes, [])
 
     def test_insert_failure_rolls_back_and_redacts_driver_details(self) -> None:

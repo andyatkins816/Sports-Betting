@@ -31,7 +31,10 @@ from the outstanding set.
 failure codes, at most five total attempts, reviewed delays, and a bounded
 provider `Retry-After`. A disabled policy, non-retryable failure, exhausted
 attempt budget, or excessive delay becomes a terminal dead-letter plan for
-human review.
+human review. The durable outbox runtime is narrower: it schedules a retry only
+when the provider adapter proves that no request was sent. A provider response,
+including `Retry-After`, is not itself replay-safety proof and cannot authorize
+another request in this milestone.
 
 Migration `006_ingestion_control_plane.sql` adds four append-only records:
 
@@ -87,12 +90,38 @@ It neither publishes the outbox nor imports a worker, provider client,
 credential source, or scheduler. The authorization table is deliberately
 unseeded, so this milestone cannot authorize production work.
 
-Quota-receipt selection is source-type independent only under the explicit
-assumption that the reviewed provider reports one shared account-wide quota
-pool. Before activating more than one source type, the retained authorization
-manifest must establish that shared-pool rule. Otherwise add and enforce a
-durable `quota_pool` binding, or fail closed by requiring the receipt's exact
-source type.
+Migration `008_ingestion_outbox_runtime.sql` and the broker-neutral
+`sam_analytics.ingestion_outbox_runtime` close the next durability gap without
+activating ingestion. The publisher claims one outbox intent under a
+database-owned lease, sends only `dispatch_id` and `attempt_number`, and then
+records delivery. A crash after broker acceptance may therefore redeliver the
+same small message, but cannot lose the durable intent. The consumer claims an
+exact attempt and commits its `running` transition before it can invoke a
+provider callback. A duplicate or expired in-flight attempt is treated as
+inconclusive and cannot automatically make another provider request; recovery
+requires explicit reconciliation. The dispatch snapshots the rate/quota inputs
+and a canonical SHA-256 of the ordered retry delays and maximum retry delay, so
+reusing a policy-version label with changed retry behavior fails closed. Only
+reviewed, finite failure classes with `request_not_sent` proof may schedule a
+bounded retry, and success is bound to the exact payload receipt, provider use,
+authorization, quota receipt, request fingerprint, and attempt.
+
+`sam_analytics.ingestion_outbox_repository` exposes only those narrow stored
+functions, validates every returned shape inside the transaction, and commits
+only a result the Python boundary can decode. The migration adds append-only
+publication-claim, publication-delivery, attempt-claim,
+attempt-receipt, and attempt-completion facts, revokes public execution of its
+functions, and leaves runtime-role grants for a later least-privilege rollout.
+There is intentionally no broker adapter, provider callback, credential
+loader, scheduler, task registration, or active composition root.
+
+Quota-receipt selection and reservations are provider-wide only under the
+explicit assumption that every authorized credential/account for that provider
+reports one shared account-wide quota pool. Source type is not a quota-pool
+identity. Before activating even one source type, the retained authorization
+manifest and staging evidence must establish that shared-pool rule. Otherwise
+persist an opaque `quota_pool_id` on receipts, authorizations, dispatches, and
+reservations and serialize/account within that exact pool.
 
 ## Monitoring contract
 
@@ -125,28 +154,39 @@ claim ingestion health.
 
 ## Still required before activation
 
-This migration is intentionally unwired. A later reviewed change must:
+This runtime is intentionally unwired. A later reviewed change must:
 
-1. implement an idempotent outbox publisher and worker consumer that append and
-   commit their `running` transition under the provider lock before any
-   provider request can occur, then bind each resulting payload receipt to the
-   exact dispatch and attempt (and therefore its immutable authorization) with
-   provider/source/license/window validation and replay tests;
-2. add an append-only authorization revocation/supersession fact and require a
-   fresh validity check before every retry; the current finite authorization
-   window does not model early termination;
-3. add an append-only quota-reconciliation fact before any terminal reservation
+1. add reviewed broker-specific publisher and consumer composition around the
+   broker-neutral runtime, a function-only runtime database role, and a trusted
+   receipt-insert routine; direct table writes remain forbidden. The deployment
+   must also verify that the application schema is migration-role-owned and
+   untrusted roles, including `PUBLIC`, have no schema `CREATE` privilege;
+2. add an execution authorization/fence immediately before every socket write.
+   It must recheck fresh quota, spacing, authorization, and revocation, pass a
+   database-derived absolute deadline into the provider adapter, and enforce
+   timeout/cancellation so a paused process cannot resume outside its lease;
+3. add append-only authorization revocation/supersession facts and revalidate
+   them before every attempt, including the first. Cap authorization review
+   horizons or require periodic reauthorization; a finite timestamp alone is
+   not sufficient;
+4. prove the provider has one account-wide quota pool or add and enforce the
+   exact opaque `quota_pool_id` binding described above;
+5. design a fenced recovery procedure for a crash after `running` commits and
+   test it. Until then an unresolved attempt intentionally blocks its provider
+   lane rather than risking a duplicate licensed call;
+6. make retry completion atomically convert any unsafe or unreservable retry to
+   a durable dead letter so a failed reservation cannot leave the claim stuck;
+7. add an append-only quota-reconciliation fact before any terminal reservation
    may be released; until then every historical reservation remains outstanding;
-4. load the sanitized health facts into the existing status contract and send
+8. load the sanitized health facts into the existing status contract and send
    alert codes to a private monitoring service;
-5. add the separately contracted results-provider and settlement path;
-6. document current provider rights, quota rules, polling cadence, retention,
-   incident response, and a monthly cost ceiling;
-7. pass CI, staging migration/restore testing, replay/concurrency tests, and a
-   new explicit human activation review; and
-8. issue fresh least-privilege staging credentials only after those checks.
+9. add the separately contracted results-provider and settlement path; and
+10. document current provider rights, quota rules, polling cadence, retention,
+    incident response, and cost ceiling; then pass CI, staging migration/restore,
+    replay/concurrency/crash tests, and a new explicit human activation review
+    before issuing fresh least-privilege credentials.
 
-Until all eight items are complete, keep provider workers suspended,
+Until all ten items are complete, keep provider workers suspended,
 Auto-Deploy off, scheduler/Beat/Cron absent, the production evidence bucket
 empty, and prediction delivery blocked. The eventual runtime database role
 must be separate from the migration/admin role, deny authorization inserts and

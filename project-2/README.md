@@ -23,14 +23,19 @@ temporary provider/storage credentials were removed. It has no schedule,
 results backend, settlement task, or public-output path. Do not add a provider
 key or other worker-only configuration to the public web service.
 
-The next code-only foundation is documented in
+The inactive code-only foundation is documented in
 [`docs/INGESTION_CONTROL_PLANE.md`](docs/INGESTION_CONTROL_PLANE.md). Its pure
-planner is disabled by default, and its unwired PostgreSQL admission repository
-can only persist a pending dispatch bundle after atomically binding the exact
-reviewed provider use and quota receipt used for the decision. The
-authorization table is intentionally empty, and there is still no publisher,
-consumer, scheduler, credential loader, or provider call. It cannot make
-another provider request by itself.
+planner is disabled by default, and its PostgreSQL admission repository can
+only persist a pending dispatch bundle after atomically binding the exact
+reviewed provider use and quota receipt used for the decision. An unwired,
+broker-neutral runtime now claims outbox work with database-owned leases,
+records publication only after broker acceptance, commits one exact running
+attempt before an injected executor can run, and binds a successful completion
+to its exact immutable provider receipt. Ambiguous running attempts are never
+automatically reclaimed. The authorization table is intentionally empty, and
+there is still no scheduler, broker adapter, provider executor, credential
+loader, or active worker composition root. This code cannot make another
+provider request by itself.
 
 See [private worker admission](docs/PRIVATE_WORKER_ADMISSION.md) and
 [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md) for

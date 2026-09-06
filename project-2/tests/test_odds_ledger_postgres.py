@@ -7,18 +7,17 @@ which proves that the Python transaction and database integrity triggers agree.
 
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
 from sam_analytics.odds_ledger import OddsLedger, PreparedOddsPayload
 from sam_analytics.provider_contracts import ApprovedProviderContract, ProviderContractRegistry
 from sam_analytics.raw_payload_store import InMemoryRawPayloadStore
-
 
 _DATABASE_URL = os.getenv("DATABASE_URL")
 _PSYCOPG_AVAILABLE = importlib.util.find_spec("psycopg") is not None
@@ -27,7 +26,7 @@ _PSYCOPG_AVAILABLE = importlib.util.find_spec("psycopg") is not None
 @unittest.skipUnless(_DATABASE_URL and _PSYCOPG_AVAILABLE, "requires disposable PostgreSQL")
 class OddsLedgerPostgresTests(unittest.TestCase):
     def setUp(self):
-        self.now = datetime.now(timezone.utc)
+        self.now = datetime.now(UTC)
         self.event_id = f"ci-event-{uuid4().hex}"
         self.contracts = ProviderContractRegistry(
             [
@@ -84,7 +83,9 @@ class OddsLedgerPostgresTests(unittest.TestCase):
 
     def test_receipts_provenance_and_snapshot_links_are_written_together(self):
         first = self.ledger.persist(self._payload(b'{"response":1}', received_at=self.now), now=self.now)
-        later = self.now + timedelta(seconds=1)
+        # Migration 008 rejects future-dated provider evidence.  Sampling after
+        # the first committed write preserves ordering without inventing time.
+        later = datetime.now(UTC)
         second = self.ledger.persist(
             self._payload(b'{"response":1,"replayed":true}', received_at=later), now=later
         )
@@ -140,7 +141,7 @@ class OddsLedgerPostgresTests(unittest.TestCase):
 
     def test_same_provider_quote_time_with_a_corrected_price_is_a_new_snapshot(self):
         first = self.ledger.persist(self._payload(b'{"response":1}', received_at=self.now), now=self.now)
-        later = self.now + timedelta(seconds=1)
+        later = datetime.now(UTC)
         correction = self.ledger.persist(
             self._payload(
                 b'{"response":2,"price":-105}',

@@ -21,6 +21,7 @@ from sam_analytics.ingestion_dispatch import (
     RetryDisposition,
     admit_dispatch,
     plan_retry,
+    retry_schedule_sha256,
 )
 from sam_analytics.ingestion_runs import IngestionFailureCode
 
@@ -464,6 +465,31 @@ class IngestionDispatchTests(unittest.TestCase):
 
         self.assertEqual(disabled.disposition, RetryDisposition.DEAD_LETTER)
         self.assertEqual(disabled.dead_letter_reason, DeadLetterReason.POLICY_DISABLED)
+
+    def test_retry_schedule_fingerprint_binds_order_count_and_maximum(self) -> None:
+        baseline = retry_schedule_sha256(self.policy)
+
+        self.assertEqual(
+            baseline,
+            "7251b5da350a580a36c74d5780a56e62267b1f9cc273147fd15991c2ad07d3bb",
+        )
+        for changed in (
+            replace(
+                self.policy,
+                retry_delays=(timedelta(minutes=5), timedelta(seconds=30)),
+            ),
+            replace(
+                self.policy,
+                retry_delays=(
+                    timedelta(seconds=30),
+                    timedelta(minutes=5),
+                    timedelta(minutes=10),
+                ),
+            ),
+            replace(self.policy, max_retry_delay=timedelta(hours=2)),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(retry_schedule_sha256(changed), baseline)
 
     def test_policy_and_candidate_bounds_reject_unsafe_inputs(self) -> None:
         with self.assertRaises(DispatchValidationError):

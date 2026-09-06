@@ -310,8 +310,12 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
                 id, provider, source_type, request_fingerprint_sha256,
                 window_start, window_end, estimated_cost, policy_version,
                 max_attempts, admitted_at, idempotency_key,
-                provider_use_authorization_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                provider_use_authorization_id, min_request_interval,
+                quota_floor, quota_max_age, retry_schedule_sha256
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                interval '0 seconds', 0, interval '5 minutes', repeat('a', 64)
+            )
             """,
             (
                 dispatch_id,

@@ -31,6 +31,7 @@ from sam_analytics.ingestion_dispatch import (
     QuotaReservation,
     QuotaSnapshot,
     admit_dispatch,
+    retry_schedule_sha256,
 )
 from sam_analytics.provider_contracts import (
     ProviderContractViolation,
@@ -94,7 +95,7 @@ class _Cursor(Protocol):
     def fetchall(self) -> Sequence[Sequence[Any]]:
         ...
 
-    def __enter__(self) -> "_Cursor":
+    def __enter__(self) -> _Cursor:
         ...
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
@@ -232,6 +233,7 @@ class PostgresIngestionAdmissionRepository:
                                 plan=plan,
                                 provider_use_authorization_id=authorization_id,
                                 provider_payload_receipt_id=quota_receipt_id,
+                                policy=policy,
                                 now=now,
                             )
                             for plan in decision.admitted
@@ -355,6 +357,7 @@ def _read_authorization_id(
     if (
         len(row) != 2
         or not isinstance(row[0], UUID)
+        or row[0].int == 0
         or not isinstance(row[1], str)
         or _SHA256_RE.fullmatch(row[1]) is None
     ):
@@ -390,7 +393,7 @@ def _read_quota_snapshot(
     row = cursor.fetchone()
     if row is None:
         return None, None
-    if len(row) != 3 or not isinstance(row[0], UUID):
+    if len(row) != 3 or not isinstance(row[0], UUID) or row[0].int == 0:
         raise IngestionAdmissionRepositoryUnavailable(
             "stored provider quota observation is invalid"
         )
@@ -522,6 +525,7 @@ def _insert_initial_bundle(
     plan: PlannedDispatch,
     provider_use_authorization_id: UUID,
     provider_payload_receipt_id: UUID,
+    policy: DispatchPolicy,
     now: datetime,
 ) -> PersistedAdmission:
     dispatch_id = uuid4()
@@ -532,8 +536,12 @@ def _insert_initial_bundle(
             id, provider, source_type, request_fingerprint_sha256,
             window_start, window_end, estimated_cost, policy_version,
             max_attempts, admitted_at, idempotency_key,
-            provider_use_authorization_id
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            provider_use_authorization_id, min_request_interval,
+            quota_floor, quota_max_age, retry_schedule_sha256
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s
+        )
         """,
         (
             dispatch_id,
@@ -548,6 +556,10 @@ def _insert_initial_bundle(
             now,
             plan.idempotency_key,
             provider_use_authorization_id,
+            policy.min_request_interval,
+            policy.quota_floor,
+            policy.quota_max_age,
+            retry_schedule_sha256(policy),
         ),
     )
     cursor.execute(
