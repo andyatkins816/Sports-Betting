@@ -28,7 +28,12 @@ modeling = [
     # The deployment image installs this extra so every candidate is available
     # to the isolated training worker.  The runtime still fails closed if the
     # dependency is absent rather than substituting a synthetic model.
-    "scikit-learn>=1.5,<2",
+    # Exact versions keep an independently approved serialized model loadable
+    # across routine image rebuilds.
+    "joblib==1.6.0",
+    "numpy==2.5.3",
+    "scikit-learn==1.9.0",
+    "scipy==1.18.1",
 ]
 dev = [
     "bandit[toml]>=1.7,<2",

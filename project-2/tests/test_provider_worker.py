@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
-import io
 import inspect
+import io
+import json
 import os
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from sam_analytics.modeling import (
     PREGAME_H2H_FEATURE_SCHEMA,
     FittedProbabilityModel,
     ModelCandidate,
+    PredictionInput,
     ProbabilityMetrics,
     PromotionDecision,
 )
@@ -83,6 +85,33 @@ class ProviderWorkerTests(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
+    @staticmethod
+    def _artifact_envelope(worker, *, payload: bytes = b"joblib-payload") -> bytes:
+        header = {
+            "format_version": 1,
+            "runtime": worker._model_runtime_versions(),
+            "data_fingerprint_sha256": "a" * 64,
+            "candidate": {
+                "name": "logistic_baseline",
+                "family": "logistic_regression",
+                "random_state": 20260904,
+                "hyperparameters": {},
+            },
+            "schema": worker._model_schema_payload(),
+            "training_rows": 750,
+        }
+        encoded_header = json.dumps(
+            header,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return (
+            worker._MODEL_ARTIFACT_MAGIC
+            + len(encoded_header).to_bytes(4, "big")
+            + encoded_header
+            + payload
+        )
+
     def test_import_requires_exact_provider_shadow_boundary(self) -> None:
         valid = self._environment()
         self._load_worker(valid)
@@ -130,6 +159,11 @@ class ProviderWorkerTests(unittest.TestCase):
                     "schedule": 3600,
                     "options": {"queue": "sam_provider_shadow", "expires": 3300},
                 },
+                "generate-approved-predictions-every-five-minutes": {
+                    "task": "sam_analytics.generate_approved_predictions",
+                    "schedule": 300,
+                    "options": {"queue": "sam_provider_shadow", "expires": 240},
+                },
             },
         )
         self.assertFalse(app.conf.task_send_sent_event)
@@ -145,6 +179,10 @@ class ProviderWorkerTests(unittest.TestCase):
         )
         self.assertEqual(
             app.conf.task_routes["sam_analytics.train_model_candidate"]["queue"],
+            "sam_provider_shadow",
+        )
+        self.assertEqual(
+            app.conf.task_routes["sam_analytics.generate_approved_predictions"]["queue"],
             "sam_provider_shadow",
         )
         self.assertEqual(
@@ -211,6 +249,26 @@ class ProviderWorkerTests(unittest.TestCase):
 
         with patch.object(worker, "_execute_model_training", return_value=None) as execute:
             result = worker.train_model_candidate.apply(throw=True)
+
+        self.assertTrue(result.successful())
+        self.assertIsNone(result.result)
+        execute.assert_called_once_with()
+
+    def test_model_inference_task_is_bounded_no_retry_and_returns_nothing(self) -> None:
+        worker = self._load_worker(self._environment())
+
+        self.assertEqual(
+            tuple(inspect.signature(worker.generate_approved_predictions.run).parameters),
+            (),
+        )
+        self.assertFalse(worker.generate_approved_predictions.acks_late)
+        self.assertFalse(worker.generate_approved_predictions.reject_on_worker_lost)
+        self.assertEqual(worker.generate_approved_predictions.max_retries, 0)
+        self.assertEqual(worker.generate_approved_predictions.soft_time_limit, 60)
+        self.assertEqual(worker.generate_approved_predictions.time_limit, 75)
+
+        with patch.object(worker, "_execute_model_inference", return_value=None) as execute:
+            result = worker.generate_approved_predictions.apply(throw=True)
 
         self.assertTrue(result.successful())
         self.assertIsNone(result.result)
@@ -349,13 +407,340 @@ class ProviderWorkerTests(unittest.TestCase):
             training_rows=750,
         )
 
-        artifact, digest = worker._serialize_model_candidate(model)
-        restored = worker.joblib.load(io.BytesIO(artifact))
+        artifact, digest = worker._serialize_model_candidate(
+            model,
+            data_fingerprint_sha256="a" * 64,
+        )
+        prefix_size = len(worker._MODEL_ARTIFACT_MAGIC) + 4
+        header_size = int.from_bytes(
+            artifact[len(worker._MODEL_ARTIFACT_MAGIC) : prefix_size],
+            "big",
+        )
+        header_end = prefix_size + header_size
+        restored_header = json.loads(artifact[prefix_size:header_end])
+        restored_payload = worker.joblib.load(io.BytesIO(artifact[header_end:]))
 
         self.assertEqual(digest, worker.hashlib.sha256(artifact).hexdigest())
-        self.assertEqual(restored["candidate"]["name"], "logistic_baseline")
-        self.assertEqual(restored["training_rows"], 750)
-        self.assertNotIn("released_at", restored)
+        self.assertEqual(restored_header["format_version"], 1)
+        self.assertEqual(restored_header["runtime"], worker._model_runtime_versions())
+        self.assertEqual(restored_header["data_fingerprint_sha256"], "a" * 64)
+        self.assertEqual(restored_header["candidate"]["name"], "logistic_baseline")
+        self.assertEqual(restored_header["training_rows"], 750)
+        self.assertNotIn("released_at", restored_header)
+        self.assertEqual(restored_payload["estimator"], {"coefficient": 0.25})
+        self.assertIsNone(restored_payload["calibrator"])
+
+    def test_approved_artifact_is_checked_before_deserialization(self) -> None:
+        worker = self._load_worker(self._environment())
+        now = datetime.now(UTC)
+        record = {
+            "id": uuid4(),
+            "version": "sam-approved-v1",
+            "created_at": now - timedelta(hours=2),
+            "released_at": now - timedelta(hours=1),
+            "artifact_format": worker._MODEL_ARTIFACT_FORMAT,
+            "artifact_bytes": b"corrupted-model",
+            "artifact_sha256": "0" * 64,
+            "validation_report": {
+                "selected_candidate": "logistic_baseline",
+                "data_fingerprint_sha256": "a" * 64,
+                "training_rows": 750,
+            },
+        }
+
+        with patch.object(worker.joblib, "load") as load:
+            with self.assertRaisesRegex(
+                worker.WorkerConfigurationError, "checksum"
+            ):
+                worker._deserialize_approved_model(record)
+
+        load.assert_not_called()
+
+    def test_incompatible_artifact_header_is_rejected_before_deserialization(self) -> None:
+        worker = self._load_worker(self._environment())
+        now = datetime.now(UTC)
+        artifact = bytearray(self._artifact_envelope(worker))
+        prefix_size = len(worker._MODEL_ARTIFACT_MAGIC) + 4
+        header_size = int.from_bytes(
+            artifact[len(worker._MODEL_ARTIFACT_MAGIC) : prefix_size],
+            "big",
+        )
+        header_end = prefix_size + header_size
+        header = json.loads(artifact[prefix_size:header_end])
+        header["runtime"]["python"] = "0.0"
+        incompatible_header = json.dumps(
+            header,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        artifact = (
+            worker._MODEL_ARTIFACT_MAGIC
+            + len(incompatible_header).to_bytes(4, "big")
+            + incompatible_header
+            + bytes(artifact[header_end:])
+        )
+        record = {
+            "id": uuid4(),
+            "version": "sam-approved-v1",
+            "created_at": now - timedelta(hours=2),
+            "released_at": now - timedelta(hours=1),
+            "artifact_format": worker._MODEL_ARTIFACT_FORMAT,
+            "artifact_bytes": artifact,
+            "artifact_sha256": worker.hashlib.sha256(artifact).hexdigest(),
+            "validation_report": {
+                "selected_candidate": "logistic_baseline",
+                "data_fingerprint_sha256": "a" * 64,
+                "training_rows": 750,
+            },
+        }
+
+        with patch.object(worker.joblib, "load") as load:
+            with self.assertRaisesRegex(worker.WorkerConfigurationError, "incompatible"):
+                worker._deserialize_approved_model(record)
+
+        load.assert_not_called()
+
+    def test_approved_artifact_restores_with_governance_release_time(self) -> None:
+        worker = self._load_worker(self._environment())
+        now = datetime.now(UTC)
+        artifact = self._artifact_envelope(worker)
+        estimator = MagicMock()
+        estimator.classes_ = [0, 1]
+        estimator.predict_proba.return_value = [[0.4, 0.6]]
+        payload = {
+            "estimator": estimator,
+            "calibrator": None,
+        }
+        model_id = uuid4()
+        record = {
+            "id": model_id,
+            "version": "sam-approved-v1",
+            "created_at": now - timedelta(hours=2),
+            "released_at": now - timedelta(hours=1),
+            "artifact_format": worker._MODEL_ARTIFACT_FORMAT,
+            "artifact_bytes": artifact,
+            "artifact_sha256": worker.hashlib.sha256(artifact).hexdigest(),
+            "validation_report": {
+                "selected_candidate": "logistic_baseline",
+                "data_fingerprint_sha256": "a" * 64,
+                "training_rows": 750,
+            },
+        }
+
+        with patch.object(worker.joblib, "load", return_value=payload):
+            restored_id, version, released_at, model = worker._deserialize_approved_model(
+                record
+            )
+
+        self.assertEqual(restored_id, str(model_id))
+        self.assertEqual(version, "sam-approved-v1")
+        self.assertEqual(released_at, record["released_at"])
+        self.assertEqual(model.trained_at, record["created_at"])
+        request = PredictionInput(
+            event_id=str(uuid4()),
+            event_starts_at=now + timedelta(hours=1),
+            decision_at=now,
+            features_available_at=now - timedelta(minutes=1),
+            source_snapshot_ids=(str(uuid4()),),
+            features={"market_probability": 0.55},
+        )
+        self.assertEqual(model.predict_probability(request), 0.6)
+
+    def test_inference_waits_without_deserializing_when_no_model_is_approved(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+
+        with (
+            patch.object(worker, "_load_approved_model_record", return_value=None),
+            patch.object(worker, "_deserialize_approved_model") as deserialize,
+            patch.object(worker, "load_h2h_market_prediction_inputs") as load_inputs,
+        ):
+            result = worker._execute_model_inference(environ=environment)
+
+        self.assertIsNone(result)
+        deserialize.assert_not_called()
+        load_inputs.assert_not_called()
+
+    def test_approved_model_loader_uses_latest_governance_state(self) -> None:
+        worker = self._load_worker(self._environment())
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        expected = {"id": uuid4(), "version": "sam-approved-v1"}
+        cursor.fetchone.return_value = expected
+        now = datetime.now(UTC)
+
+        with patch.object(worker.psycopg, "connect", return_value=connection):
+            record = worker._load_approved_model_record(
+                database_url=self._environment()["DATABASE_URL"],
+                sport="baseball_mlb",
+                now=now,
+            )
+
+        self.assertEqual(record, expected)
+        sql, params = cursor.execute.call_args.args
+        normalized = " ".join(sql.split())
+        self.assertIn("DISTINCT ON (decision.model_id)", normalized)
+        self.assertIn("latest.decision = 'approved'", normalized)
+        self.assertIn("public.digest(model.artifact_bytes, 'sha256')", normalized)
+        self.assertEqual(params["now"], now)
+        self.assertEqual(params["sport"], "baseball_mlb")
+        connection.close.assert_called_once_with()
+
+    def test_inference_scores_and_persists_eligible_inputs(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+        now = datetime.now(UTC)
+        released_at = now - timedelta(hours=1)
+        request = PredictionInput(
+            event_id=str(uuid4()),
+            event_starts_at=now + timedelta(minutes=20),
+            decision_at=now - timedelta(minutes=10),
+            features_available_at=now - timedelta(minutes=11),
+            source_snapshot_ids=tuple(str(uuid4()) for _ in range(4)),
+            features={"market_probability": 0.55},
+        )
+        model = MagicMock()
+        model.predict_probability.return_value = 0.61
+
+        with (
+            patch.object(worker, "datetime") as clock,
+            patch.object(worker, "_load_approved_model_record", return_value={"id": uuid4()}),
+            patch.object(
+                worker,
+                "_deserialize_approved_model",
+                return_value=("model-id", "sam-approved-v1", released_at, model),
+            ),
+            patch.object(
+                worker,
+                "load_h2h_market_prediction_inputs",
+                return_value=(request,),
+            ) as load_inputs,
+            patch.object(worker, "_persist_model_predictions", return_value=1) as persist,
+        ):
+            clock.now.return_value = now
+            worker._execute_model_inference(environ=environment)
+
+        load_inputs.assert_called_once_with(
+            environment["DATABASE_URL"],
+            sport="baseball_mlb",
+            model_id="model-id",
+            now=now,
+            released_at=released_at,
+        )
+        model.predict_probability.assert_called_once_with(request)
+        persist.assert_called_once_with(
+            database_url=environment["DATABASE_URL"],
+            model_id="model-id",
+            released_at=released_at,
+            requests=(request,),
+            probabilities=(0.61,),
+        )
+
+    def test_prediction_persistence_is_idempotent_and_rechecks_approval(self) -> None:
+        worker = self._load_worker(self._environment())
+        now = datetime.now(UTC)
+        released_at = now - timedelta(hours=1)
+        event_id = str(uuid4())
+        source_ids = tuple(sorted(str(uuid4()) for _ in range(4)))
+        request = PredictionInput(
+            event_id=event_id,
+            event_starts_at=now + timedelta(minutes=20),
+            decision_at=now - timedelta(minutes=10),
+            features_available_at=now - timedelta(minutes=11),
+            source_snapshot_ids=source_ids,
+            features={"market_probability": 0.55},
+        )
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [
+            {"decision": "approved", "decided_at": released_at},
+            {"id": uuid4()},
+        ]
+        cursor.fetchall.return_value = [
+            {"id": source_id, "primary_provenance_id": uuid4()}
+            for source_id in source_ids
+        ]
+
+        with patch.object(worker.psycopg, "connect", return_value=connection):
+            inserted = worker._persist_model_predictions(
+                database_url=self._environment()["DATABASE_URL"],
+                model_id=str(uuid4()),
+                released_at=released_at,
+                requests=(request,),
+                probabilities=(0.6,),
+            )
+
+        self.assertEqual(inserted, 1)
+        lock_sql = " ".join(cursor.execute.call_args_list[0].args[0].split())
+        self.assertIn("public.lock_model_governance", lock_sql)
+        governance_sql = " ".join(cursor.execute.call_args_list[1].args[0].split())
+        self.assertIn("JOIN LATERAL", governance_sql)
+        self.assertIn("ORDER BY state.decided_at DESC", governance_sql)
+        self.assertNotIn("state.decided_at <=", governance_sql)
+        self.assertNotIn("FOR UPDATE", governance_sql)
+        evidence_sql = " ".join(cursor.execute.call_args_list[2].args[0].split())
+        self.assertIn("event.starts_at > clock_timestamp()", evidence_sql)
+        insert_sql, insert_params = cursor.execute.call_args_list[3].args
+        self.assertIn("INSERT INTO prediction", insert_sql)
+        self.assertIn("event.starts_at > clock_timestamp()", insert_sql)
+        self.assertEqual(str(insert_params[3]), "0.600000")
+        self.assertTrue(str(insert_params[4]).startswith("data:application/vnd.sam.feature-vector+json;base64,"))
+        connection.commit.assert_called_once_with()
+
+        suspended = MagicMock()
+        suspended_cursor = suspended.cursor.return_value.__enter__.return_value
+        suspended_cursor.fetchone.return_value = {
+            "decision": "suspended",
+            "decided_at": now,
+        }
+        with patch.object(worker.psycopg, "connect", return_value=suspended):
+            suppressed = worker._persist_model_predictions(
+                database_url=self._environment()["DATABASE_URL"],
+                model_id=str(uuid4()),
+                released_at=released_at,
+                requests=(request,),
+                probabilities=(0.6,),
+            )
+        self.assertEqual(suppressed, 0)
+        suspended.rollback.assert_called_once_with()
+
+    def test_prediction_persistence_skips_an_event_that_has_started(self) -> None:
+        worker = self._load_worker(self._environment())
+        now = datetime.now(UTC)
+        released_at = now - timedelta(hours=1)
+        request = PredictionInput(
+            event_id=str(uuid4()),
+            event_starts_at=now + timedelta(seconds=1),
+            decision_at=now - timedelta(minutes=30),
+            features_available_at=now - timedelta(minutes=31),
+            source_snapshot_ids=tuple(sorted(str(uuid4()) for _ in range(4))),
+            features={"market_probability": 0.55},
+        )
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [
+            {"decision": "approved", "decided_at": released_at},
+            {"started": True},
+        ]
+        cursor.fetchall.return_value = []
+
+        with patch.object(worker.psycopg, "connect", return_value=connection):
+            inserted = worker._persist_model_predictions(
+                database_url=self._environment()["DATABASE_URL"],
+                model_id=str(uuid4()),
+                released_at=released_at,
+                requests=(request,),
+                probabilities=(0.6,),
+            )
+
+        self.assertEqual(inserted, 0)
+        self.assertFalse(
+            any(
+                "INSERT INTO prediction" in call.args[0]
+                for call in cursor.execute.call_args_list
+            )
+        )
+        connection.commit.assert_called_once_with()
 
     def test_model_candidate_persistence_is_unapproved_and_idempotent(self) -> None:
         worker = self._load_worker(self._environment())
@@ -385,7 +770,7 @@ class ProviderWorkerTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (version) DO NOTHING", registry_sql)
         self.assertEqual(registry_params[0], "sam-test-version")
         self.assertEqual(registry_params[5], digest)
-        self.assertEqual(registry_params[6], "joblib-sklearn-v1")
+        self.assertEqual(registry_params[6], worker._MODEL_ARTIFACT_FORMAT)
         self.assertEqual(registry_params[7], artifact)
         signal_sql = cursor.execute.call_args_list[1].args[0]
         self.assertIn("INSERT INTO operational_signal", signal_sql)
