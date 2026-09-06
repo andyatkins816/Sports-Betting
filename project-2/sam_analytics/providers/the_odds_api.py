@@ -1,4 +1,4 @@
-"""Adapter for The Odds API v4 featured pregame markets.
+"""Adapter for The Odds API v4 featured pregame markets and completed scores.
 
 The provider includes live events in its odds response. This adapter filters
 them because the current SAM pregame pipeline must never mix live and pregame
@@ -12,15 +12,15 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from datetime import UTC, datetime
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from sam_analytics.ingestion import RawOddsQuote
-
 
 _DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 _MAX_RESPONSE_BYTES_HARD_LIMIT = 100 * 1024 * 1024
@@ -67,6 +67,44 @@ class OddsApiRequestScope:
     regions: tuple[str, ...]
     markets: tuple[str, ...]
     bookmakers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompletedScore:
+    """One completed provider event, preserving its exact event identity."""
+
+    provider: str
+    event_id: str
+    sport: str
+    league: str
+    commence_time: datetime
+    last_update: datetime
+    home_team: str
+    away_team: str
+    home_score: int
+    away_score: int
+
+
+@dataclass(frozen=True)
+class ScoresApiRequestScope:
+    """Safe score-request identity that contains no credential or URL."""
+
+    sport_key: str
+    days_from: int
+
+
+@dataclass(frozen=True)
+class ScoresApiFetch:
+    """Completed scores plus the exact response bytes needed for provenance."""
+
+    scores: tuple[CompletedScore, ...]
+    requests_remaining: int | None
+    requests_used: int | None
+    request_cost: int | None
+    skipped_incomplete_events: int
+    raw_payload: bytes
+    received_at: datetime
+    request_scope: ScoresApiRequestScope
 
 
 @dataclass(frozen=True)
@@ -124,7 +162,7 @@ class TheOddsApiClient:
         requested_bookmakers = (
             _parse_scope_values(bookmakers, field="bookmakers") if bookmakers is not None else ()
         )
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         if not _is_aware_datetime(now):
             raise ValueError("now must be timezone-aware")
         request_scope = OddsApiRequestScope(
@@ -159,6 +197,93 @@ class TheOddsApiClient:
             received_at=response.received_at,
             request_scope=request_scope,
         )
+
+    def fetch_scores(self, sport_key: str, *, days_from: int = 3) -> ScoresApiFetch:
+        """Fetch completed scores for one sport without retaining request credentials."""
+        if not isinstance(sport_key, str) or not _SPORT_KEY.fullmatch(sport_key):
+            raise ValueError("sport_key must contain only lowercase letters, digits, and underscores")
+        if isinstance(days_from, bool) or not isinstance(days_from, int) or not 1 <= days_from <= 3:
+            raise ValueError("days_from must be an integer from 1 to 3")
+        request_scope = ScoresApiRequestScope(sport_key=sport_key, days_from=days_from)
+        response = self._request(
+            f"/sports/{sport_key}/scores",
+            {
+                "apiKey": self._api_key,
+                "daysFrom": str(days_from),
+                "dateFormat": "iso",
+            },
+        )
+        scores, skipped = self.parse_scores_response(response.payload, sport_key=sport_key)
+        return ScoresApiFetch(
+            scores=scores,
+            requests_remaining=_header_int(response.headers, "x-requests-remaining"),
+            requests_used=_header_int(response.headers, "x-requests-used"),
+            request_cost=_header_int(response.headers, "x-requests-last"),
+            skipped_incomplete_events=skipped,
+            raw_payload=response.raw_payload,
+            received_at=response.received_at,
+            request_scope=request_scope,
+        )
+
+    @staticmethod
+    def parse_scores_response(
+        payload: Any,
+        *,
+        sport_key: str,
+    ) -> tuple[tuple[CompletedScore, ...], int]:
+        """Parse completed matching-sport events and count ignored incomplete rows."""
+        if not isinstance(payload, list):
+            raise TheOddsApiError("provider returned an unexpected scores payload")
+        if not isinstance(sport_key, str) or not _SPORT_KEY.fullmatch(sport_key):
+            raise ValueError("sport_key must contain only lowercase letters, digits, and underscores")
+
+        completed_scores: list[CompletedScore] = []
+        skipped_incomplete_events = 0
+        for event in payload:
+            if not isinstance(event, Mapping):
+                raise TheOddsApiError("provider score event is not an object")
+            event_id = _required_text(event, "id")
+            provider_sport = _required_text(event, "sport_key")
+            if provider_sport != sport_key:
+                raise TheOddsApiError("provider returned a score sport that did not match the request")
+            completed = event.get("completed")
+            if not isinstance(completed, bool):
+                raise TheOddsApiError("provider returned invalid completed status")
+            if not completed:
+                skipped_incomplete_events += 1
+                continue
+
+            home_team = _required_text(event, "home_team")
+            away_team = _required_text(event, "away_team")
+            if home_team == away_team:
+                raise TheOddsApiError("provider returned identical home and away teams")
+            scores = _required_list(event, "scores")
+            if len(scores) != 2:
+                raise TheOddsApiError("completed provider event must contain exactly two scores")
+            score_by_team: dict[str, int] = {}
+            for score in scores:
+                team = _required_text(score, "name")
+                if team in score_by_team:
+                    raise TheOddsApiError("completed provider event contains duplicate team scores")
+                score_by_team[team] = _nonnegative_integer_score(score.get("score"))
+            if set(score_by_team) != {home_team, away_team}:
+                raise TheOddsApiError("completed provider scores did not match the event teams")
+
+            completed_scores.append(
+                CompletedScore(
+                    provider="the_odds_api",
+                    event_id=event_id,
+                    sport=provider_sport,
+                    league=_optional_text(event, "sport_title") or provider_sport,
+                    commence_time=_parse_provider_time(event.get("commence_time")),
+                    last_update=_parse_provider_time(event.get("last_update")),
+                    home_team=home_team,
+                    away_team=away_team,
+                    home_score=score_by_team[home_team],
+                    away_score=score_by_team[away_team],
+                )
+            )
+        return tuple(completed_scores), skipped_incomplete_events
 
     @staticmethod
     def parse_response(
@@ -287,7 +412,7 @@ class TheOddsApiClient:
                 received_at = _utc_now()
                 if not _is_aware_datetime(received_at):
                     raise TheOddsApiError("local receipt clock is missing timezone")
-                received_at = received_at.astimezone(timezone.utc)
+                received_at = received_at.astimezone(UTC)
             try:
                 return _OddsApiResponse(
                     payload=json.loads(raw_payload),
@@ -416,7 +541,24 @@ def _parse_provider_time(value: Any, *, default: datetime | None = None) -> date
         raise TheOddsApiError("provider timestamp is invalid") from None
     if parsed.tzinfo is None:
         raise TheOddsApiError("provider timestamp is missing timezone")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
+
+
+def _nonnegative_integer_score(value: object) -> int:
+    if isinstance(value, bool):
+        raise TheOddsApiError("provider returned invalid team score")
+    if isinstance(value, int):
+        score = value
+    elif isinstance(value, str) and _SCORE.fullmatch(value):
+        try:
+            score = int(value)
+        except ValueError:
+            raise TheOddsApiError("provider returned invalid team score") from None
+    else:
+        raise TheOddsApiError("provider returned invalid team score")
+    if score < 0:
+        raise TheOddsApiError("provider returned invalid team score")
+    return score
 
 
 def _quote_id(
@@ -437,7 +579,7 @@ def _quote_id(
         "line": float(line) if line is not None else None,
         "market": market,
         "selection": selection,
-        "updated": updated.astimezone(timezone.utc)
+        "updated": updated.astimezone(UTC)
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z"),
     }
@@ -472,7 +614,8 @@ def _is_aware_datetime(value: object) -> bool:
 def _utc_now() -> datetime:
     """Keep the receipt clock injectable in tests without accepting provider time."""
 
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 _SCOPE_VALUE = re.compile(r"^[a-z0-9_]{1,100}$")
+_SCORE = re.compile(r"^[0-9]+$")
