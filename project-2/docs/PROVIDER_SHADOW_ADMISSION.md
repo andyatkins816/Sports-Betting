@@ -94,3 +94,21 @@ expiration and remains absent from the worker. Leave Auto-Deploy off, do not
 resume the worker, and keep the seven-day R2 lock in place. Any additional
 provider request requires a new deliberate approval and a reviewed admission-ID
 change.
+
+## Completed proof record — 2026-09-05
+
+The single admitted request completed and was verified across all three
+private records:
+
+- Celery task `29ab597f-df4f-41cc-9a95-40b08732899c` was received and
+  succeeded once;
+- fixed audit run `f3cd3650-568a-4f36-89b8-acde937c23a1` reached `succeeded`
+  at state sequence 3 with attempt count 1; and
+- its receipt and raw-data provenance matched the retained R2 object digest
+  `309b6d1cdd2b999c6830bd4cd4492d17e919c65c62e6e5385c1f703c9d0a898b`.
+
+Cleanup also completed: `sam-provider-shadow-worker` is suspended with
+Auto-Deploy off, the provider and R2 credential values were removed from the
+worker, the provider key was rotated, and the temporary R2 token was
+permanently deleted. The prefix lock remains in place. Do not dispatch the task
+again; this admission is consumed.

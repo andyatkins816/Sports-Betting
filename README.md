@@ -29,8 +29,13 @@ The current implementation provides:
   data;
 - a separate, staging-only provider-shadow worker that admits one manually
   dispatched The Odds API request after exact license, quota, private-storage,
-  database, and broker checks; it is not scheduled, deployed, or authorized for
-  public output by source code alone;
+  database, and broker checks; its single admitted proof succeeded and the
+  worker is now suspended and credential-free;
+- an inactive ingestion control-plane foundation with deterministic
+  idempotency, quota reservations, request spacing, bounded retries,
+  dead-letter decisions, an append-only transactional outbox schema, and a
+  sanitized fail-closed health projection; no scheduler or production worker
+  is wired to it;
 - a single analytical endpoint, `POST /api/v1/evaluate`, which never places a
   bet or records a fictional result.
 
@@ -62,6 +67,7 @@ Do not use that compose file as the production secret-management plan.
 - [sam.vegas deployment runbook](project-2/docs/DEPLOYMENT_SAM_VEGAS.md)
 - [Private raw-evidence object storage](project-2/docs/RAW_EVIDENCE_OBJECT_STORAGE.md)
 - [Manual provider-shadow admission](project-2/docs/PROVIDER_SHADOW_ADMISSION.md)
+- [Inactive ingestion control plane](project-2/docs/INGESTION_CONTROL_PLANE.md)
 - [PostgreSQL audit schema](project-2/migrations/001_initial.sql) and
   [provider-receipt lineage migration](project-2/migrations/004_provider_payload_receipts.sql)
 

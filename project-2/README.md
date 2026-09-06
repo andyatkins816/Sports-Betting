@@ -16,11 +16,18 @@ There is intentionally no automatically active provider worker. A concrete
 private Cloudflare R2 raw-evidence adapter is wired to a manual, staging-only
 synthetic storage probe, and the synthetic fixture cannot create odds, events,
 model inputs, or public output. A separate `provider_worker.py` composition root
-now admits one operator-dispatched The Odds API shadow request under an exact
+admitted one operator-dispatched The Odds API shadow request under an exact
 provider contract, request scope, quota bound, private evidence prefix, and
-append-only run audit. It has no schedule, retry loop, results backend,
-settlement task, or public-output path. Do not add its provider key or other
-worker-only configuration to the public web service.
+append-only run audit. That proof succeeded; the worker is suspended and its
+temporary provider/storage credentials were removed. It has no schedule,
+results backend, settlement task, or public-output path. Do not add a provider
+key or other worker-only configuration to the public web service.
+
+The next code-only foundation is documented in
+[`docs/INGESTION_CONTROL_PLANE.md`](docs/INGESTION_CONTROL_PLANE.md). Its pure
+planner is disabled by default, its retry and quota decisions have no side
+effects, and its append-only dispatch/outbox schema is not connected to any
+worker or scheduler. It cannot make another provider request by itself.
 
 See [private worker admission](docs/PRIVATE_WORKER_ADMISSION.md) and
 [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md) for

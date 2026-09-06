@@ -12,12 +12,16 @@ PostgreSQL health repository independently testable.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
+from sam_analytics.ingestion_health import IngestionHealth
 
-CONTRACT_VERSION = "v1"
+CONTRACT_VERSION = "v2"
+_SAFE_PROVIDER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_SAFE_MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,10 @@ class OperationalSignals:
     # signals may be set only by a trusted repository/worker health probe.
     audit_repository_healthy: bool = False
     worker_queue_healthy: bool = False
+    # This must be the result of the pure, validated ingestion-health
+    # evaluator. Arbitrary dictionaries from a browser or provider response are
+    # not accepted at this boundary.
+    ingestion_health: IngestionHealth | None = None
 
 
 def build_integration_status(
@@ -63,18 +71,24 @@ def build_integration_status(
         raise ValueError("quote_max_age_seconds must be positive")
     if model_evaluation_max_age_seconds <= 0:
         raise ValueError("model_evaluation_max_age_seconds must be positive")
-    current_time = _as_utc(now or datetime.now(timezone.utc))
+    current_time = _as_utc(now or datetime.now(UTC))
     if current_time is None:
         raise ValueError("now must be timezone-aware")
 
     signals = signals or OperationalSignals()
     data = _data_status(signals, quote_max_age_seconds, current_time)
     model = _model_status(signals, current_time, model_evaluation_max_age_seconds)
+    ingestion = _ingestion_status(
+        signals.ingestion_health,
+        quote_max_age_seconds,
+        expected_provider=signals.provider,
+        now=current_time,
+    )
 
     blockers: list[str] = []
-    if not database_configured:
+    if database_configured is not True:
         blockers.append("audit database is not configured")
-    if not redis_configured:
+    if redis_configured is not True:
         blockers.append("worker queue is not configured")
     if signals.audit_repository_healthy is not True:
         blockers.append("audit database health is unverified")
@@ -84,6 +98,8 @@ def build_integration_status(
         blockers.append(f"data freshness is {data['status']}")
     if model["status"] != "healthy":
         blockers.append(f"model health is {model['status']}")
+    if ingestion["status"] != "healthy":
+        blockers.append(f"ingestion health is {ingestion['status']}")
 
     prediction_delivery_enabled = not blockers
     return {
@@ -102,6 +118,7 @@ def build_integration_status(
                 database_configured, signals.audit_repository_healthy
             ),
             "worker_queue": _dependency_status(redis_configured, signals.worker_queue_healthy),
+            "ingestion": ingestion,
             "prediction_delivery": "available" if prediction_delivery_enabled else "disabled",
             "blockers": blockers,
         },
@@ -112,7 +129,12 @@ def _data_status(
     signals: OperationalSignals, quote_max_age_seconds: int, now: datetime
 ) -> dict[str, Any]:
     observed_at = _as_utc(signals.latest_quote_at)
-    provider = signals.provider if isinstance(signals.provider, str) and signals.provider.strip() else None
+    provider = (
+        signals.provider
+        if isinstance(signals.provider, str)
+        and _SAFE_PROVIDER_RE.fullmatch(signals.provider) is not None
+        else None
+    )
     if signals.latest_quote_at is None:
         return {
             "status": "unavailable",
@@ -130,9 +152,10 @@ def _data_status(
             "max_age_seconds": quote_max_age_seconds,
         }
 
-    age_seconds = round((now - observed_at).total_seconds(), 3)
+    raw_age_seconds = (now - observed_at).total_seconds()
+    age_seconds = round(raw_age_seconds, 3)
     return {
-        "status": "fresh" if provider and age_seconds <= quote_max_age_seconds else (
+        "status": "fresh" if provider and raw_age_seconds <= quote_max_age_seconds else (
             "stale" if provider else "invalid"
         ),
         "provider": provider,
@@ -146,7 +169,12 @@ def _model_status(
     signals: OperationalSignals, now: datetime, model_evaluation_max_age_seconds: int
 ) -> dict[str, Any]:
     evaluated_at = _as_utc(signals.model_evaluated_at)
-    version = signals.model_version if isinstance(signals.model_version, str) and signals.model_version.strip() else None
+    version = (
+        signals.model_version
+        if isinstance(signals.model_version, str)
+        and _SAFE_MODEL_VERSION_RE.fullmatch(signals.model_version) is not None
+        else None
+    )
     payload: dict[str, Any] = {
         "status": "unavailable",
         "version": version,
@@ -180,11 +208,11 @@ def _model_status(
 def _as_utc(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         return None
-    return value.astimezone(timezone.utc)
+    return value.astimezone(UTC)
 
 
 def _timestamp(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _timestamp_or_none(value: datetime | None) -> str | None:
@@ -195,3 +223,63 @@ def _dependency_status(configured: bool, healthy: object) -> str:
     if configured is not True:
         return "unconfigured"
     return "healthy" if healthy is True else "unverified"
+
+
+def _ingestion_status(
+    health: object,
+    quote_max_age_seconds: int,
+    *,
+    expected_provider: object,
+    now: datetime,
+) -> dict[str, Any]:
+    if (
+        type(health) is IngestionHealth
+        and isinstance(expected_provider, str)
+        and health.provider == expected_provider
+        and health.evaluated_at <= now <= health.valid_until
+    ):
+        return health.to_public_dict()
+    # Missing or malformed internal monitoring input gets a complete,
+    # predictable unavailable shape. Unknown policy thresholds stay null
+    # instead of being guessed by this presentation layer.
+    payload: dict[str, Any] = {
+        "status": "unavailable",
+        "quote_freshness": {
+            "status": "unavailable",
+            "age_seconds": None,
+            "max_age_seconds": quote_max_age_seconds,
+        },
+        "worker_activity": {
+            "status": "unavailable",
+            "age_seconds": None,
+            "max_age_seconds": None,
+            "basis": "durable_activity_only",
+        },
+        "queue": {
+            "status": "unavailable",
+            "depth_band": "unavailable",
+            "oldest_age_seconds": None,
+            "max_oldest_age_seconds": None,
+            "retry_wait": "unavailable",
+        },
+        "quota": {
+            "status": "unavailable",
+            "remaining_band": "unavailable",
+            "age_seconds": None,
+            "max_age_seconds": None,
+        },
+        "dead_letter": {
+            "status": "unavailable",
+            "count_band": "unavailable",
+        },
+        "alert_codes": [
+            "feed_unavailable",
+            "worker_activity_unavailable",
+            "queue_unavailable",
+            "quota_unavailable",
+            "dead_letter_unavailable",
+        ],
+    }
+    if type(health) is IngestionHealth:
+        payload["alert_codes"].insert(0, "monitoring_invalid")
+    return payload
