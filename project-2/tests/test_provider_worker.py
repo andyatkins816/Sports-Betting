@@ -8,17 +8,22 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from uuid import UUID, uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
-from sam_analytics.ingestion_runs import IngestionFailureCode
+from sam_analytics.ingestion_runs import IngestionFailureCode, IngestionRunState
+from sam_analytics.odds_ledger import ResultsLedgerWriteResult
 from sam_analytics.provider_shadow import ProviderShadowFetchFailure
 from sam_analytics.providers.the_odds_api import (
+    CompletedScore,
     OddsApiFetch,
     OddsApiRequestScope,
+    ScoresApiFetch,
+    ScoresApiRequestScope,
     TheOddsApiError,
 )
 
@@ -86,7 +91,7 @@ class ProviderWorkerTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self._load_worker(changed)
 
-    def test_worker_has_one_queue_and_fixed_five_minute_schedule(self) -> None:
+    def test_worker_has_one_queue_and_bounded_fixed_schedules(self) -> None:
         environment = self._environment()
         worker = self._load_worker(environment)
         app = worker.create_celery_app(environment)
@@ -111,7 +116,12 @@ class ProviderWorkerTests(unittest.TestCase):
                     "task": "sam_analytics.ingest_the_odds_api_shadow",
                     "schedule": 300,
                     "options": {"queue": "sam_provider_shadow", "expires": 240},
-                }
+                },
+                "settle-the-odds-api-scores-hourly": {
+                    "task": "sam_analytics.settle_the_odds_api_scores",
+                    "schedule": 3600,
+                    "options": {"queue": "sam_provider_shadow", "expires": 3300},
+                },
             },
         )
         self.assertFalse(app.conf.task_send_sent_event)
@@ -119,6 +129,10 @@ class ProviderWorkerTests(unittest.TestCase):
         self.assertFalse(app.conf.worker_enable_remote_control)
         self.assertEqual(
             app.conf.task_routes["sam_analytics.ingest_the_odds_api_shadow"]["queue"],
+            "sam_provider_shadow",
+        )
+        self.assertEqual(
+            app.conf.task_routes["sam_analytics.settle_the_odds_api_scores"]["queue"],
             "sam_provider_shadow",
         )
         self.assertEqual(
@@ -148,19 +162,42 @@ class ProviderWorkerTests(unittest.TestCase):
         self.assertIsNone(result.result)
         execute.assert_called_once_with(task_id=task_id)
 
+    def test_score_task_is_zero_argument_no_retry_and_returns_nothing(self) -> None:
+        worker = self._load_worker(self._environment())
+        task_id = str(uuid4())
+
+        self.assertEqual(
+            tuple(inspect.signature(worker.settle_the_odds_api_scores.run).parameters),
+            (),
+        )
+        self.assertFalse(worker.settle_the_odds_api_scores.acks_late)
+        self.assertFalse(worker.settle_the_odds_api_scores.reject_on_worker_lost)
+        self.assertEqual(worker.settle_the_odds_api_scores.max_retries, 0)
+
+        with patch.object(worker, "_execute_score_settlement", return_value=None) as execute:
+            result = worker.settle_the_odds_api_scores.apply(
+                task_id=task_id,
+                throw=True,
+            )
+
+        self.assertTrue(result.successful())
+        self.assertIsNone(result.result)
+        execute.assert_called_once_with(task_id=task_id)
+
     def test_execution_revalidates_before_constructing_dependencies(self) -> None:
         worker = self._load_worker(self._environment())
         environment = self._environment()
         environment["APP_ENV"] = "production"
 
-        with patch.object(worker, "TheOddsApiClient") as client_factory:
-            with self.assertRaises(worker.WorkerConfigurationError):
-                worker._execute_provider_shadow(
-                    task_id=str(uuid4()),
-                    environ=environment,
-                )
-
-        client_factory.assert_not_called()
+        for executor in (
+            worker._execute_provider_shadow,
+            worker._execute_score_settlement,
+        ):
+            with self.subTest(executor=executor.__name__):
+                with patch.object(worker, "TheOddsApiClient") as client_factory:
+                    with self.assertRaises(worker.WorkerConfigurationError):
+                        executor(task_id=str(uuid4()), environ=environment)
+                client_factory.assert_not_called()
 
     def test_execution_injects_only_reviewed_private_dependencies(self) -> None:
         environment = self._environment()
@@ -214,6 +251,12 @@ class ProviderWorkerTests(unittest.TestCase):
         ledger_factory.assert_called_once()
         self.assertEqual(ledger_factory.call_args.args, (environment["DATABASE_URL"],))
         self.assertEqual(ledger_factory.call_args.kwargs["raw_payload_store"], store)
+        self.assertEqual(
+            ledger_factory.call_args.kwargs["provider_contracts"]
+            .contracts[0]
+            .permitted_source_types,
+            frozenset({"odds", "result"}),
+        )
         orchestrator_factory.assert_called_once()
         self.assertEqual(
             orchestrator_factory.call_args.kwargs["odds_ledger"],
@@ -232,6 +275,86 @@ class ProviderWorkerTests(unittest.TestCase):
             run_id=UUID(task_id),
         )
 
+    def test_score_execution_records_one_attempt_fetch_and_persist(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+        task_id = str(uuid4())
+        fetched = _scores_fetch()
+        prepared = object()
+        store = MagicMock()
+        ledger = MagicMock()
+        repository = MagicMock()
+        repository.create_run.side_effect = lambda _run, queued: queued
+        repository.append_transition.side_effect = (
+            lambda _run, _previous, transition: transition
+        )
+        ledger.persist_results.return_value = ResultsLedgerWriteResult(
+            status="accepted",
+            receipt_sha256="a" * 64,
+            provenance_sha256="b" * 64,
+            events_created=1,
+            results_created=1,
+            results_replayed=0,
+            provenance_links_created=1,
+            incidents_created=0,
+        )
+        client = MagicMock()
+        client.fetch_scores.return_value = fetched
+
+        with (
+            patch.object(worker, "TheOddsApiClient", return_value=client) as client_factory,
+            patch.object(
+                worker.S3CompatibleRawPayloadStore,
+                "from_environment",
+                return_value=store,
+            ),
+            patch.object(worker, "OddsLedger", return_value=ledger) as ledger_factory,
+            patch.object(
+                worker,
+                "PostgresIngestionRunRepository",
+                return_value=repository,
+            ),
+            patch.object(
+                worker,
+                "prepare_the_odds_api_results_payload",
+                return_value=prepared,
+            ) as prepare,
+        ):
+            result = worker._execute_score_settlement(
+                task_id=task_id,
+                environ=environment,
+            )
+
+        self.assertIsNone(result)
+        client_factory.assert_called_once_with(
+            environment["ODDS_PROVIDER_API_KEY"],
+            max_response_bytes=10485760,
+        )
+        client.fetch_scores.assert_called_once_with("baseball_mlb", days_from=3)
+        prepare.assert_called_once_with(
+            fetched,
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+        )
+        ledger.persist_results.assert_called_once_with(prepared, now=ANY)
+        contract = ledger_factory.call_args.kwargs["provider_contracts"].contracts[0]
+        self.assertEqual(contract.permitted_source_types, frozenset({"odds", "result"}))
+
+        run, queued = repository.create_run.call_args.args
+        self.assertEqual(run.id, UUID(task_id))
+        self.assertEqual(run.job_identity, f"celery:{task_id}")
+        self.assertEqual(run.provider, "the_odds_api")
+        self.assertEqual(run.source_type, "result")
+        self.assertEqual(run.max_attempts, 1)
+        self.assertEqual(queued.state, IngestionRunState.QUEUED)
+        self.assertEqual(repository.append_transition.call_count, 2)
+        running = repository.append_transition.call_args_list[0].args[2]
+        succeeded = repository.append_transition.call_args_list[1].args[2]
+        self.assertEqual(running.state, IngestionRunState.RUNNING)
+        self.assertEqual(running.attempt_count, 1)
+        self.assertEqual(succeeded.state, IngestionRunState.SUCCEEDED)
+        self.assertEqual(succeeded.attempt_count, 1)
+
     def test_only_canonical_uuid_task_ids_enter_the_audit_ledger(self) -> None:
         worker = self._load_worker(self._environment())
         task_id = str(uuid4())
@@ -242,6 +365,67 @@ class ProviderWorkerTests(unittest.TestCase):
             with self.subTest(unsafe=unsafe):
                 with self.assertRaises(worker.WorkerConfigurationError):
                     worker._celery_job_identity(unsafe)
+
+    def test_score_fetch_uses_one_exact_scope_and_sanitizes_provider_errors(self) -> None:
+        worker = self._load_worker(self._environment())
+        settings = MagicMock(sport_key="baseball_mlb")
+        accepted = _scores_fetch()
+        client = MagicMock()
+        client.fetch_scores.return_value = accepted
+
+        self.assertIs(worker._fetch_scores_once(client, settings), accepted)
+        client.fetch_scores.assert_called_once_with("baseball_mlb", days_from=3)
+
+        for malformed in (
+            replace(accepted, requests_remaining=None),
+            replace(accepted, request_cost=1),
+            replace(
+                accepted,
+                request_scope=ScoresApiRequestScope(
+                    sport_key="basketball_nba",
+                    days_from=3,
+                ),
+            ),
+            replace(
+                accepted,
+                request_scope=ScoresApiRequestScope(
+                    sport_key="baseball_mlb",
+                    days_from=2,
+                ),
+            ),
+            replace(accepted, scores=[]),
+        ):
+            with self.subTest(malformed=malformed):
+                malformed_client = MagicMock()
+                malformed_client.fetch_scores.return_value = malformed
+                with self.assertRaises(ProviderShadowFetchFailure) as raised:
+                    worker._fetch_scores_once(malformed_client, settings)
+                self.assertEqual(
+                    raised.exception.failure_code,
+                    IngestionFailureCode.PROVIDER_RESPONSE_INVALID,
+                )
+
+        for message, expected in (
+            (
+                "The Odds API returned HTTP 429",
+                IngestionFailureCode.PROVIDER_RATE_LIMITED,
+            ),
+            (
+                "The Odds API request failed",
+                IngestionFailureCode.PROVIDER_TEMPORARY_UNAVAILABLE,
+            ),
+            (
+                "The Odds API returned invalid JSON",
+                IngestionFailureCode.PROVIDER_RESPONSE_INVALID,
+            ),
+        ):
+            with self.subTest(message=message):
+                failed_client = MagicMock()
+                failed_client.fetch_scores.side_effect = TheOddsApiError(message)
+                with self.assertRaises(ProviderShadowFetchFailure) as raised:
+                    worker._fetch_scores_once(failed_client, settings)
+                self.assertEqual(raised.exception.failure_code, expected)
+                self.assertIsNone(raised.exception.__context__)
 
     def test_provider_errors_are_finitely_classified_without_chaining(self) -> None:
         worker = self._load_worker(self._environment())
@@ -468,6 +652,36 @@ def _quote(
         league="MLB",
         home_team="Home",
         away_team="Away",
+    )
+
+
+def _scores_fetch() -> ScoresApiFetch:
+    now = datetime(2026, 9, 6, 12, tzinfo=UTC)
+    return ScoresApiFetch(
+        scores=(
+            CompletedScore(
+                provider="the_odds_api",
+                event_id="event-1",
+                sport="baseball_mlb",
+                league="MLB",
+                commence_time=now - timedelta(hours=3),
+                last_update=now - timedelta(minutes=5),
+                home_team="Home",
+                away_team="Away",
+                home_score=4,
+                away_score=2,
+            ),
+        ),
+        requests_remaining=498,
+        requests_used=2,
+        request_cost=2,
+        skipped_incomplete_events=0,
+        raw_payload=b'[{"completed":true}]',
+        received_at=now,
+        request_scope=ScoresApiRequestScope(
+            sport_key="baseball_mlb",
+            days_from=3,
+        ),
     )
 
 

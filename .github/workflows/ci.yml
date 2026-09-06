@@ -137,7 +137,7 @@ jobs:
             --env SAM_RAW_EVIDENCE_S3_ACCESS_KEY_ID=ci-scoped-r2-access-id \
             --env SAM_RAW_EVIDENCE_S3_SECRET_ACCESS_KEY=ci-scoped-r2-secret \
             sam-analytics:${{ github.sha }} \
-            celery -A provider_worker:celery_app worker --loglevel=INFO --concurrency=1 \
+            celery -A provider_worker:celery_app worker --beat --loglevel=INFO --concurrency=1 \
               --queues=sam_provider_shadow --without-gossip --without-mingle
           for attempt in $(seq 1 30); do
             if docker logs sam-provider-worker-ci 2>&1 | grep -q ' ready\.'; then

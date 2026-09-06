@@ -1,114 +1,61 @@
-# Manual provider-shadow admission
+# Provider ingestion runtime
 
-This milestone permits one bounded The Odds API request into private staging.
-It must run in a **separate Render Background Worker** that is suspended by
-default. Do not reuse `sam-api` or `sam-synthetic-worker`.
+SAM's licensed odds feed runs in the separate Render Background Worker
+`sam-provider-shadow-worker`. It ingests pregame `h2h` odds every five minutes
+and completed scores every hour for the configured sport. It does not belong in
+the public `sam-api` service.
 
-The admitted request selects exactly one sport from `baseball_mlb`,
-`basketball_nba`, or `americanfootball_nfl` (the template defaults to MLB),
-one region (`us`), and one market (`h2h`). That is one provider request and at
-most one provider credit under the reviewed v4 quota calculation. Within the
-same retained append-only staging database, a fixed, code-reviewed audit ID
-also blocks every later task before it can contact the provider. Replacing or
-resetting that audit database is outside this admission and requires a new
-review. There is no scheduler, retry loop, public output, result backend,
-results ingestion, settlement, or model use.
+## Required rollout order
 
-## Prerequisites
+1. Merge the reviewed code and let `sam-api` apply every numbered PostgreSQL
+   migration through `008_result_ingestion.sql`.
+2. Confirm the migration completed before resuming this worker. The old schema
+   cannot retain provider score corrections.
+3. Confirm the provider plan can sustain the configured maximum: 288 one-credit
+   odds requests plus 24 two-credit score requests per day.
+4. Confirm the private R2 bucket and `raw/the_odds_api/` retention rule, then add
+   the least-privilege provider, R2, PostgreSQL, and Key Value credentials to
+   this worker only.
+5. Deploy or resume the worker with the command below. Keep Auto-Deploy off for
+   the initial rollout.
 
-Do not create or resume the worker until all of these are true:
+Never activate the scheduler before the migration is current. Never place the
+provider key, R2 credentials, database URL, or Key Value URL in source control,
+logs, the public web service, or the frontend.
 
-- the provider-shadow pull request has passed checks and is merged to `main`;
-- Cloudflare R2 bucket `sam-raw-evidence-staging` has an enabled seven-day
-  bucket-lock rule scoped to the exact prefix `raw/the_odds_api/`;
-- a new, separate R2 Object Read & Write token is restricted to only
-  `sam-raw-evidence-staging` and has not been placed in another service;
-- a newly rotated replacement The Odds API key is available for this one
-  shadow request; do not reuse the previously exposed key; and
-- Render's **Internal Database URL** and **Internal Key Value URL** are ready.
+## Render configuration
 
-Keep the provider key, R2 credentials, database URL, and Redis URL only in the
-worker's Render environment. Never paste them into source control, logs, a pull
-request, or a public service.
-
-## Render worker configuration
-
-Create `sam-provider-shadow-worker` as a Docker Background Worker from `main`.
-Set Auto-Deploy to **Off**. When the Render service's Root Directory is
-`project-2`, use:
+When the service Root Directory is `project-2`, use:
 
 | Setting | Value |
 | --- | --- |
 | Root Directory | `project-2` |
 | Docker Build Context Directory | `.` |
 | Dockerfile Path | `Dockerfile` |
-| Start command | `celery -A provider_worker:celery_app worker --loglevel=INFO --concurrency=1 --queues=sam_provider_shadow --without-gossip --without-mingle` |
+| Start command | `celery -A provider_worker:celery_app worker --beat --loglevel=INFO --concurrency=1 --queues=sam_provider_shadow --without-gossip --without-mingle` |
 
-Enter the exact environment shape from `.env.provider-shadow.example`,
-replacing only its blank secret/private values and the `ACCOUNT_ID` endpoint
-placeholder. Do not add environment variables copied from `sam-api`, Base44, a
-results worker, a scheduler, or an administrator account.
+Use the exact environment-variable names from `.env.provider-shadow.example`.
+The worker remains fail-closed unless its staging boundary, one approved sport,
+`us` region, `h2h` market, provider license, private Render connections, and R2
+evidence prefix all match the reviewed settings.
 
-Let the first deployment reach `Live` and confirm the log says the Celery
-worker is ready. Then suspend the worker until the operator is ready to perform
-the single approved test.
+## Verification
 
-## Send exactly one task
+After startup, Render logs must show both the Celery worker and embedded
+scheduler running. Do not send a duplicate manual task while waiting. A healthy
+runtime then shows:
 
-Resume the worker and wait for the Celery `ready` line. In that worker's Render
-Web Shell, run this command exactly once, with no arguments or custom task ID:
+- an odds task received and succeeded within five minutes;
+- a score task received and succeeded within one hour;
+- matching immutable receipts and successful ingestion runs in PostgreSQL; and
+- retained objects under `raw/the_odds_api/sha256/` in the private R2 bucket.
 
-```text
-celery -A provider_worker:celery_app call --queue sam_provider_shadow sam_analytics.ingest_the_odds_api_shadow
-```
+Any task error, missing evidence object, missing receipt, or mismatched audit
+record is a failed rollout. Suspend the worker before changing configuration or
+retrying manually.
 
-Record the generated task ID. Do not run the command again, place it in a loop,
-create a Cron Job, start Celery Beat, or enable Auto-Deploy.
+## Earlier one-request proof
 
-## Verify, then shut down
-
-Treat the run as complete only when all three private records agree:
-
-1. **Render logs:** the recorded task ID is `received` and then `succeeded`,
-   with no configuration, provider, evidence, or database error.
-2. **Cloudflare R2:** an object exists under
-   `raw/the_odds_api/sha256/<digest>` in `sam-raw-evidence-staging`; the bucket
-   remains private and the seven-day prefix lock remains enabled.
-3. **PostgreSQL:** the matching `ingestion_run` has provider `the_odds_api`,
-   admission ID `f3cd3650-568a-4f36-89b8-acde937c23a1`, job identity
-   `celery:<task-id>`, and latest state `succeeded`; its provider payload
-   receipt and raw-data provenance rows exist. A valid empty admitted `h2h`
-   response can create no odds snapshots and still be a successful receipt.
-   If an exchange adds `h2h_lay`, the exact response remains in raw evidence,
-   but that added market is not normalized into the h2h-only ledger.
-
-An object without a matching successful audit, or an audit without its object
-and receipt, is inconclusive. Do not retry automatically or infer success from
-the Render deployment badge alone.
-
-After verification, suspend `sam-provider-shadow-worker` immediately. While it
-is suspended, remove the provider key and both R2 credential values from the
-worker, and rotate or revoke the provider key. Revoke the separate R2 token when
-that control is available; otherwise make sure it has the shortest approved
-expiration and remains absent from the worker. Leave Auto-Deploy off, do not
-resume the worker, and keep the seven-day R2 lock in place. Any additional
-provider request requires a new deliberate approval and a reviewed admission-ID
-change.
-
-## Completed proof record — 2026-09-05
-
-The single admitted request completed and was verified across all three
-private records:
-
-- Celery task `29ab597f-df4f-41cc-9a95-40b08732899c` was received and
-  succeeded once;
-- fixed audit run `f3cd3650-568a-4f36-89b8-acde937c23a1` reached `succeeded`
-  at state sequence 3 with attempt count 1; and
-- its receipt and raw-data provenance matched the retained R2 object digest
-  `309b6d1cdd2b999c6830bd4cd4492d17e919c65c62e6e5385c1f703c9d0a898b`.
-
-Cleanup also completed: `sam-provider-shadow-worker` is suspended with
-Auto-Deploy off, the provider and R2 credential values were removed from the
-worker, the provider key was rotated, and the temporary R2 token was
-permanently deleted. The prefix lock remains in place. Do not dispatch the task
-again; this admission is consumed.
+The original bounded proof succeeded on 2026-09-05 and was then shut down. That
+historical task does not activate this recurring runtime and must not be
+replayed.
