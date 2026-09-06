@@ -205,6 +205,85 @@ class IngestionControlPlaneMigrationTests(unittest.TestCase):
 )
 class IngestionControlPlanePostgresTests(unittest.TestCase):
     @staticmethod
+    def _provider_authorization_id(connection) -> UUID:
+        connection.execute(
+            """
+            INSERT INTO provider_use_authorization (
+                provider, license_scope, license_version, source_type,
+                exposure, authorization_manifest_sha256, reviewed_at,
+                effective_from, effective_until
+            ) VALUES (
+                'sam_synthetic', 'synthetic_test_only', 'ci-v1',
+                'storage_probe', 'private_raw', %s,
+                '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00',
+                '2099-01-01 00:00:00+00'
+            )
+            ON CONFLICT (
+                provider, license_scope, license_version, source_type, exposure
+            ) DO NOTHING
+            """,
+            ("a" * 64,),
+        )
+        row = connection.execute(
+            """
+            SELECT id
+            FROM provider_use_authorization
+            WHERE provider = 'sam_synthetic'
+              AND license_scope = 'synthetic_test_only'
+              AND license_version = 'ci-v1'
+              AND source_type = 'storage_probe'
+              AND exposure = 'private_raw'
+            """
+        ).fetchone()
+        if row is None:
+            raise AssertionError("CI provider authorization is unavailable")
+        return row[0]
+
+    @staticmethod
+    def _quota_receipt_id(connection) -> UUID:
+        request_sha256 = "b" * 64
+        payload_sha256 = "c" * 64
+        receipt_sha256 = "d" * 64
+        observed_at = datetime(2026, 1, 2, tzinfo=UTC)
+        connection.execute(
+            """
+            INSERT INTO provider_payload_receipt (
+                provider, source_type, request_fingerprint_sha256,
+                payload_sha256, payload_uri, captured_at, received_at,
+                provider_response_status, payload_bytes,
+                provider_quota_remaining, provider_quota_used,
+                provider_quota_last, schema_version, license_scope,
+                license_version, receipt_sha256, created_at
+            ) VALUES (
+                'sam_synthetic', 'storage_probe', %s, %s, %s,
+                %s, %s, 200, 0, 10000, 0, 1, 'ci-v1',
+                'synthetic_test_only', 'ci-v1', %s, %s
+            )
+            ON CONFLICT (receipt_sha256) DO NOTHING
+            """,
+            (
+                request_sha256,
+                payload_sha256,
+                f"s3://ci-ingestion-admission/raw/synthetic/sha256/{payload_sha256}",
+                observed_at,
+                observed_at,
+                receipt_sha256,
+                observed_at,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT id
+            FROM provider_payload_receipt
+            WHERE receipt_sha256 = %s
+            """,
+            (receipt_sha256,),
+        ).fetchone()
+        if row is None:
+            raise AssertionError("CI provider quota receipt is unavailable")
+        return row[0]
+
+    @staticmethod
     def _new_dispatch_values() -> tuple[UUID, str, str, datetime]:
         return (
             uuid4(),
@@ -222,13 +301,17 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
         request_fingerprint: str,
         admitted_at: datetime,
     ) -> None:
+        authorization_id = IngestionControlPlanePostgresTests._provider_authorization_id(
+            connection
+        )
         connection.execute(
             """
             INSERT INTO ingestion_dispatch (
                 id, provider, source_type, request_fingerprint_sha256,
                 window_start, window_end, estimated_cost, policy_version,
-                max_attempts, admitted_at, idempotency_key
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                max_attempts, admitted_at, idempotency_key,
+                provider_use_authorization_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 dispatch_id,
@@ -242,6 +325,7 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
                 2,
                 admitted_at,
                 idempotency_key,
+                authorization_id,
             ),
         )
 
@@ -263,13 +347,15 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
             request_fingerprint=request_fingerprint,
             admitted_at=admitted_at,
         )
+        quota_receipt_id = cls._quota_receipt_id(connection)
         connection.execute(
             """
             INSERT INTO ingestion_quota_reservation (
-                ingestion_dispatch_id, attempt_number, reserved_credits, reserved_at
-            ) VALUES (%s, 1, 1, %s)
+                ingestion_dispatch_id, attempt_number, reserved_credits,
+                reserved_at, provider_payload_receipt_id
+            ) VALUES (%s, 1, 1, %s, %s)
             """,
-            (dispatch_id, admitted_at),
+            (dispatch_id, admitted_at, quota_receipt_id),
         )
         connection.execute(
             """
@@ -371,13 +457,15 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
             retry_not_before_at=retry_at,
             occurred_at=failure_at,
         )
+        quota_receipt_id = cls._quota_receipt_id(connection)
         connection.execute(
             """
             INSERT INTO ingestion_quota_reservation (
-                ingestion_dispatch_id, attempt_number, reserved_credits, reserved_at
-            ) VALUES (%s, 2, 1, %s)
+                ingestion_dispatch_id, attempt_number, reserved_credits,
+                reserved_at, provider_payload_receipt_id
+            ) VALUES (%s, 2, 1, %s, %s)
             """,
-            (dispatch_id, failure_at),
+            (dispatch_id, failure_at, quota_receipt_id),
         )
         connection.execute(
             """

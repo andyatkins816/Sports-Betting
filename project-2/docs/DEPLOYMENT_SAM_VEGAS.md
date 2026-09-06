@@ -132,7 +132,7 @@ store. A secret belongs in exactly the service that needs it.
 | `SAM_STATUS_API_KEY` | Render `sam-api`, then Base44 server secret named `SAM_BACKEND_STATUS_API_KEY` | The only credential that authorizes `GET /api/v1/integration/status`. Send it only as a server-side `X-API-Key` header. |
 | `SAM_API_KEY` | Render only, if retained | Reserved for the separate private research capability. Never send this key to Base44; that capability is disabled outside development/test. |
 | `ALLOWED_ORIGINS` | Render `sam-api` | Exact public Base44 origins only; never use `*` for an authenticated API. |
-| `DATABASE_URL` | Render `sam-api` and future worker | Use Render's internal Postgres connection string, not an external URL. The current readiness endpoint checks it without revealing it. |
+| `DATABASE_URL` | Render `sam-api`; a distinct least-privilege value for any future worker | Use internal Postgres connections, not an external URL. Keep migration/admin authority out of runtime services; the current readiness endpoint checks its connection without revealing it. |
 | `REDIS_URL` | Render `sam-api` and future worker | Use only the private/internal Key Value connection string. The current readiness endpoint checks it without revealing it. |
 | `ODDS_PROVIDER_API_KEY` | Future private worker only | Rotate the previously exposed key first. Never add it to the web API, Base44, browser, GitHub, or logs. Staging/production `sam-api` refuses to start if this or a results-provider key is present. |
 | object-storage credentials | Future private worker only | Use the smallest provider-supported identity. For an R2 probe, scope the standard Object Read & Write token only to `sam-raw-evidence-staging`, choose a time-limited TTL, add the required prefix lock, and remove its values from the worker immediately afterward; revoke it when that control is available. Staging/production `sam-api` refuses to start if worker-only settings or credentials are present. |
@@ -151,8 +151,10 @@ AI-agent prompt.
 3. The numbered migration runner already executes as the reviewed pre-deploy
    command. For each future migration, record the version and verify a restore
    procedure before loading real provider data.
-4. Restrict database access to Render services that require it. Use a
-   least-privilege application role once the repository is implemented.
+4. Restrict database access to Render services that require it. Before any
+   dispatcher is wired, separate the migration/admin role from a
+   least-privilege runtime role that cannot insert provider authorizations,
+   bypass triggers, or write the admission tables directly.
 
 ### Stage 2 — keep the private queue/cache ready
 
@@ -220,15 +222,17 @@ That proof is still not a general provider dispatcher. The inactive
 [ingestion control-plane safety boundary](INGESTION_CONTROL_PLANE.md) now
 defines deterministic idempotency, quota/spacing/batch admission, bounded
 retry/dead-letter decisions, append-only transactional dispatch facts, and a
-sanitized monitoring projection. It is deliberately unwired and disabled by
-default; it made no additional provider request and creates no schedule.
+sanitized monitoring projection. Its unwired repository can atomically persist
+only pending intent bound to an exact reviewed-use record and quota receipt.
+The reviewed-use table is empty, so the repository fails closed. It remains
+disabled and made no additional provider request or schedule.
 
 Before starting scheduled or production ingestion, finish and test all of the
 following:
 
-- transactional Postgres persistence and source-received timestamps;
-- a transactional repository/outbox publisher that uses the new idempotency,
-  quota-reservation, and dead-letter records;
+- an idempotent outbox publisher and consumer that append their state before
+  any provider request;
+- append-only authorization revocation and quota-reservation reconciliation;
 - a results-provider contract and settlement reconciliation;
 - a trusted database adapter that supplies the new ingestion-health contract;
 - production-reviewed rate limits that respect the provider agreement and

@@ -25,9 +25,12 @@ key or other worker-only configuration to the public web service.
 
 The next code-only foundation is documented in
 [`docs/INGESTION_CONTROL_PLANE.md`](docs/INGESTION_CONTROL_PLANE.md). Its pure
-planner is disabled by default, its retry and quota decisions have no side
-effects, and its append-only dispatch/outbox schema is not connected to any
-worker or scheduler. It cannot make another provider request by itself.
+planner is disabled by default, and its unwired PostgreSQL admission repository
+can only persist a pending dispatch bundle after atomically binding the exact
+reviewed provider use and quota receipt used for the decision. The
+authorization table is intentionally empty, and there is still no publisher,
+consumer, scheduler, credential loader, or provider call. It cannot make
+another provider request by itself.
 
 See [private worker admission](docs/PRIVATE_WORKER_ADMISSION.md) and
 [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md) for
