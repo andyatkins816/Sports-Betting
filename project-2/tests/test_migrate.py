@@ -247,6 +247,25 @@ class MigrationRunnerTests(unittest.TestCase):
         self.assertIn("sports_event_append_only", migration.sql)
         self.assertIn("provider_payload_receipt_append_only", migration.sql)
 
+    def test_checked_in_model_governance_migration_serializes_decisions(self):
+        migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+        migration = next(
+            item
+            for item in discover_migrations(migrations_dir)
+            if item.filename == "010_model_governance_lock.sql"
+        )
+
+        self.assertIn("CREATE OR REPLACE FUNCTION lock_model_governance", migration.sql)
+        self.assertIn("pg_advisory_xact_lock", migration.sql)
+        self.assertIn("'sam-model-governance:' || governed_model_id::text", migration.sql)
+        self.assertIn("BEFORE INSERT ON model_governance_decision", migration.sql)
+        self.assertIn("PERFORM public.lock_model_governance(NEW.model_id)", migration.sql)
+        self.assertIn(
+            "BEFORE UPDATE OF approval_status, approved_by, approved_at ON model_registry",
+            migration.sql,
+        )
+        self.assertIn("PERFORM public.lock_model_governance(NEW.id)", migration.sql)
+
     def _connection_for_url(self, supplied_url, expected_url, connection):
         self.assertEqual(supplied_url, expected_url)
         return connection

@@ -5,6 +5,7 @@ from sam_analytics.odds import (
     american_to_decimal,
     devig_two_way,
     expected_roi,
+    market_consensus_two_way,
 )
 from sam_analytics.risk import BankrollPolicy, ExposureState, size_moneyline
 
@@ -17,6 +18,14 @@ class OddsAndRiskTests(unittest.TestCase):
         self.assertAlmostEqual(expected_roi(0.55, 2.0), 0.10)
         with self.assertRaises(OddsValidationError):
             american_to_decimal(0)
+
+    def test_market_consensus_devigs_each_book_before_robust_aggregation(self):
+        home, away = market_consensus_two_way(((2.0, 2.0), (2.2, 1.8)))
+        self.assertAlmostEqual(home, 0.475)
+        self.assertAlmostEqual(away, 0.525)
+        self.assertAlmostEqual(home + away, 1.0)
+        with self.assertRaisesRegex(OddsValidationError, "At least one complete"):
+            market_consensus_two_way(())
 
     def test_stake_is_capped_by_policy(self):
         decision = size_moneyline(

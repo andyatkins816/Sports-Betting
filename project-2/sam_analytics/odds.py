@@ -8,7 +8,8 @@ bookmaker from incomplete data.
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from collections.abc import Iterable
+from statistics import median
 
 
 class OddsValidationError(ValueError):
@@ -39,7 +40,7 @@ def implied_probability(decimal: float) -> float:
     return 1.0 / decimal
 
 
-def devig_two_way(home_decimal: float, away_decimal: float) -> Tuple[float, float]:
+def devig_two_way(home_decimal: float, away_decimal: float) -> tuple[float, float]:
     """Remove proportional margin from a two-outcome market.
 
     This is a simple normalization, not a claim that the result is a true
@@ -52,6 +53,26 @@ def devig_two_way(home_decimal: float, away_decimal: float) -> Tuple[float, floa
     if overround <= 0:
         raise OddsValidationError("Market probabilities must have positive mass")
     return home / overround, away / overround
+
+
+def market_consensus_two_way(
+    bookmaker_prices: Iterable[tuple[float, float]],
+) -> tuple[float, float]:
+    """Return a robust descriptive consensus from complete two-way books.
+
+    Each pair is de-vigged independently before the median home and away
+    probabilities are normalized.  This is a market baseline, not a trained
+    model or evidence of an independent betting edge.
+    """
+    probabilities = [devig_two_way(home, away) for home, away in bookmaker_prices]
+    if not probabilities:
+        raise OddsValidationError("At least one complete two-way market is required")
+    home = median(probability[0] for probability in probabilities)
+    away = median(probability[1] for probability in probabilities)
+    total = home + away
+    if not math.isfinite(total) or total <= 0:
+        raise OddsValidationError("Market consensus must have positive finite mass")
+    return home / total, away / total
 
 
 def expected_roi(model_probability: float, decimal_odds: float) -> float:

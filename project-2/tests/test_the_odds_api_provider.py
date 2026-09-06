@@ -1,13 +1,21 @@
+import copy
+import json
 import unittest
-from datetime import datetime, timedelta, timezone
+from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
-from sam_analytics.providers.the_odds_api import TheOddsApiClient, TheOddsApiError
+from sam_analytics.providers.the_odds_api import (
+    CompletedScore,
+    TheOddsApiClient,
+    TheOddsApiError,
+)
 
 
 class TheOddsApiProviderTests(unittest.TestCase):
     def setUp(self):
-        self.now = datetime(2026, 1, 1, 15, tzinfo=timezone.utc)
+        self.now = datetime(2026, 1, 1, 15, tzinfo=UTC)
         self.payload = [
             {
                 "id": "provider-event-1",
@@ -33,6 +41,166 @@ class TheOddsApiProviderTests(unittest.TestCase):
                 ],
             }
         ]
+        self.scores_payload = [
+            {
+                "id": "provider-event-1",
+                "sport_key": "basketball_nba",
+                "sport_title": "NBA",
+                "commence_time": (self.now - timedelta(hours=3)).isoformat(),
+                "completed": True,
+                "home_team": "Home",
+                "away_team": "Away",
+                "scores": [
+                    {"name": "Away", "score": 98},
+                    {"name": "Home", "score": "104"},
+                ],
+                "last_update": (self.now - timedelta(minutes=5)).isoformat(),
+            }
+        ]
+
+    def test_scores_parser_preserves_completed_result_and_ignores_incomplete_event(self):
+        incomplete = copy.deepcopy(self.scores_payload[0])
+        incomplete.update(
+            {
+                "id": "provider-event-2",
+                "completed": False,
+                "scores": None,
+                "last_update": None,
+            }
+        )
+
+        scores, skipped = TheOddsApiClient.parse_scores_response(
+            [*self.scores_payload, incomplete], sport_key="basketball_nba"
+        )
+
+        self.assertEqual(skipped, 1)
+        self.assertIsInstance(scores, tuple)
+        self.assertEqual(
+            scores,
+            (
+                CompletedScore(
+                    provider="the_odds_api",
+                    event_id="provider-event-1",
+                    sport="basketball_nba",
+                    league="NBA",
+                    commence_time=self.now - timedelta(hours=3),
+                    last_update=self.now - timedelta(minutes=5),
+                    home_team="Home",
+                    away_team="Away",
+                    home_score=104,
+                    away_score=98,
+                ),
+            ),
+        )
+        with self.assertRaises(FrozenInstanceError):
+            scores[0].home_score = 105
+
+    def test_scores_parser_rejects_malformed_completed_results(self):
+        invalid_payloads = []
+
+        missing_score = copy.deepcopy(self.scores_payload)
+        missing_score[0]["scores"] = missing_score[0]["scores"][:1]
+        invalid_payloads.append(("exactly two", missing_score))
+
+        wrong_team = copy.deepcopy(self.scores_payload)
+        wrong_team[0]["scores"][0]["name"] = "Other"
+        invalid_payloads.append(("did not match", wrong_team))
+
+        negative_score = copy.deepcopy(self.scores_payload)
+        negative_score[0]["scores"][0]["score"] = "-1"
+        invalid_payloads.append(("invalid team score", negative_score))
+
+        fractional_score = copy.deepcopy(self.scores_payload)
+        fractional_score[0]["scores"][0]["score"] = 98.0
+        invalid_payloads.append(("invalid team score", fractional_score))
+
+        naive_commence_time = copy.deepcopy(self.scores_payload)
+        naive_commence_time[0]["commence_time"] = "2026-01-01T12:00:00"
+        invalid_payloads.append(("missing timezone", naive_commence_time))
+
+        naive_last_update = copy.deepcopy(self.scores_payload)
+        naive_last_update[0]["last_update"] = "2026-01-01T14:55:00"
+        invalid_payloads.append(("missing timezone", naive_last_update))
+
+        invalid_completed = copy.deepcopy(self.scores_payload)
+        invalid_completed[0]["completed"] = "true"
+        invalid_payloads.append(("completed status", invalid_completed))
+
+        wrong_sport = copy.deepcopy(self.scores_payload)
+        wrong_sport[0]["sport_key"] = "baseball_mlb"
+        invalid_payloads.append(("sport.*did not match", wrong_sport))
+
+        for error, payload in invalid_payloads:
+            with self.subTest(error=error), self.assertRaisesRegex(TheOddsApiError, error):
+                TheOddsApiClient.parse_scores_response(payload, sport_key="basketball_nba")
+
+    def test_fetch_scores_preserves_exact_receipt_quota_and_sanitized_scope(self):
+        raw_payload = b" " + json.dumps(self.scores_payload, separators=(",", ":")).encode() + b"\n"
+
+        class FakeResponse:
+            status = 200
+            headers = {
+                "x-requests-remaining": "93",
+                "x-requests-used": "7",
+                "x-requests-last": "2",
+            }
+
+            def __init__(self):
+                self._was_read = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                if self._was_read:
+                    return b""
+                self._was_read = True
+                return raw_payload
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        receipt_time = self.now + timedelta(seconds=1)
+        opener = FakeOpener()
+        with (
+            patch("sam_analytics.providers.the_odds_api.build_opener", return_value=opener),
+            patch("sam_analytics.providers.the_odds_api._utc_now", return_value=receipt_time),
+        ):
+            fetched = TheOddsApiClient("never-expose-this-key").fetch_scores(
+                "basketball_nba", days_from=2
+            )
+
+        request_url = urlsplit(opener.request.full_url)
+        query = parse_qs(request_url.query)
+        self.assertEqual(request_url.path, "/v4/sports/basketball_nba/scores")
+        self.assertEqual(query["daysFrom"], ["2"])
+        self.assertEqual(query["dateFormat"], ["iso"])
+        self.assertEqual(fetched.raw_payload, raw_payload)
+        self.assertEqual(fetched.received_at, receipt_time)
+        self.assertEqual(fetched.requests_remaining, 93)
+        self.assertEqual(fetched.requests_used, 7)
+        self.assertEqual(fetched.request_cost, 2)
+        self.assertEqual(fetched.skipped_incomplete_events, 0)
+        self.assertEqual(fetched.request_scope.sport_key, "basketball_nba")
+        self.assertEqual(fetched.request_scope.days_from, 2)
+        self.assertEqual(len(fetched.scores), 1)
+        self.assertNotIn("never-expose-this-key", repr(fetched))
+        with self.assertRaises(FrozenInstanceError):
+            fetched.request_cost = 3
+
+    def test_fetch_scores_rejects_invalid_days_and_sport_before_request(self):
+        client = TheOddsApiClient("test-key")
+        for days_from in (True, "3", 0, 4):
+            with self.subTest(days_from=days_from), self.assertRaisesRegex(ValueError, "days_from"):
+                client.fetch_scores("basketball_nba", days_from=days_from)
+        with self.assertRaisesRegex(ValueError, "sport_key"):
+            client.fetch_scores("basketball_nba/../scores")
 
     def test_parser_preserves_event_market_selection_and_provider_time(self):
         quotes, skipped = TheOddsApiClient.parse_response(
@@ -322,8 +490,6 @@ class TheOddsApiProviderTests(unittest.TestCase):
             )
 
     def test_parser_validates_scope_before_live_filter_or_empty_outcomes(self):
-        import copy
-
         live_wrong_sport = copy.deepcopy(self.payload)
         live_wrong_sport[0]["commence_time"] = (
             self.now - timedelta(seconds=1)
@@ -348,8 +514,6 @@ class TheOddsApiProviderTests(unittest.TestCase):
             )
 
     def test_parser_admits_documented_h2h_lay_as_a_provider_added_companion(self):
-        import copy
-
         provider_added = copy.deepcopy(self.payload)
         provider_added[0]["bookmakers"][0]["markets"][0]["key"] = "h2h_lay"
 
@@ -378,8 +542,6 @@ class TheOddsApiProviderTests(unittest.TestCase):
 
 def _payload_with_outcome(payload, *, price=None, point=None):
     """Return an isolated payload with the first outcome selectively amended."""
-
-    import copy
 
     amended = copy.deepcopy(payload)
     outcome = amended[0]["bookmakers"][0]["markets"][0]["outcomes"][0]

@@ -4,24 +4,19 @@ This directory contains the Flask API, research primitives, database migration,
 container image, and worker entry point for SAM Analytics.
 
 `sam_analytics/` contains deterministic domain logic, a narrowly scoped The
-Odds API v4 pregame adapter, and an evidence-first persistence boundary. The
-adapter preserves exact response bytes, provider IDs/timestamps, event and
-bookmaker metadata, and sanitized quota/request scope; it filters live events
-and does not train on samples or place wagers. `odds_ledger.py` stores those
-bytes privately before a single normalized quote is committed, then records an
-immutable receipt, provenance, event identity, snapshot, and lineage link in
-one PostgreSQL transaction.
+Odds API v4 adapter, and an evidence-first persistence boundary. The adapter
+preserves exact response bytes, provider IDs/timestamps, event and bookmaker
+metadata, completed scores, and sanitized quota/request scope; it filters live
+odds and does not place wagers. `odds_ledger.py` stores those bytes privately
+before normalized quotes or results are committed, then records their immutable
+receipt, provenance, event identity, facts, and lineage in PostgreSQL.
 
-There is intentionally no automatically active provider worker. A concrete
-private Cloudflare R2 raw-evidence adapter is wired to a manual, staging-only
-synthetic storage probe, and the synthetic fixture cannot create odds, events,
-model inputs, or public output. A separate `provider_worker.py` composition root
-admitted one operator-dispatched The Odds API shadow request under an exact
-provider contract, request scope, quota bound, private evidence prefix, and
-append-only run audit. That proof succeeded; the worker is suspended and its
-temporary provider/storage credentials were removed. It has no schedule,
-results backend, settlement task, or public-output path. Do not add a provider
-key or other worker-only configuration to the public web service.
+`provider_worker.py` supplies the staging-only recurring ingestion runtime:
+pregame `h2h` odds every five minutes and completed scores every hour. Its
+scheduler runs only when the Render start command includes `--beat`; rollout
+must apply migration `008_result_ingestion.sql` first. The separate synthetic
+storage probe remains unable to create odds, events, model inputs, or public
+output. Do not add provider or R2 credentials to the public web service.
 
 The next code-only foundation is documented in
 [`docs/INGESTION_CONTROL_PLANE.md`](docs/INGESTION_CONTROL_PLANE.md). Its pure
@@ -36,7 +31,7 @@ See [private worker admission](docs/PRIVATE_WORKER_ADMISSION.md) and
 [private raw-evidence object storage](docs/RAW_EVIDENCE_OBJECT_STORAGE.md) for
 the exact synthetic staging boundary, provider-specific credential limits, and
 compensating retention controls. A real-data staging run has its own separate
-[manual provider-shadow admission](docs/PROVIDER_SHADOW_ADMISSION.md).
+[provider ingestion runtime](docs/PROVIDER_SHADOW_ADMISSION.md).
 
 The public integration surface is GET /api/v1/integration/status, protected by
 a dedicated status-only credential and limited to a sanitized readiness

@@ -13,17 +13,18 @@ dependency fail closed instead of quietly substituting a made-up model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
 import hashlib
-from itertools import groupby
 import json
 import math
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from itertools import groupby
 from numbers import Real
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .calibration import IsotonicCalibrator
 from .metrics import brier_score, calibration_bins, log_loss
+from .odds import implied_probability, market_consensus_two_way
 
 
 class ModelDataError(ValueError):
@@ -156,6 +157,16 @@ class OutcomeTrainingRow:
     outcome: int
 
 
+# One fixed decision horizon keeps every row comparable and prevents a later
+# quote from quietly changing the meaning of the feature. Changing either the
+# horizon or the calculation requires a new schema id.
+PREGAME_H2H_DECISION_LEAD = timedelta(minutes=30)
+PREGAME_H2H_FEATURE_SCHEMA = FeatureSchema(
+    schema_id="pregame-h2h-market-consensus-30m-v1",
+    features=(NumericFeature("market_probability", minimum=0.0, maximum=1.0),),
+)
+
+
 @dataclass(frozen=True)
 class AdaptedTrainingDataset:
     """Model-ready rows derived from the immutable evidence-layer contracts."""
@@ -168,6 +179,32 @@ class AdaptedTrainingDataset:
 
 def _is_aware(value: datetime) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
+
+
+def feature_schema_fingerprint(schema: FeatureSchema) -> str:
+    """Return the canonical SHA-256 identity of an ordered feature schema."""
+
+    if not isinstance(schema, FeatureSchema):
+        raise ModelDataError("feature schema fingerprinting requires a FeatureSchema")
+    payload = {
+        "schema_id": schema.schema_id,
+        "features": [
+            {
+                "name": feature.name,
+                "minimum": feature.minimum,
+                "maximum": feature.maximum,
+            }
+            for feature in schema.features
+        ],
+        "reject_unknown_features": schema.reject_unknown_features,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _validate_source_snapshots(source_snapshot_ids: Sequence[str]) -> None:
@@ -243,6 +280,642 @@ def validate_training_rows(rows: Iterable[OutcomeTrainingRow], schema: FeatureSc
             raise ModelDataError("the label source snapshot cannot also be an input feature source")
         schema.vector(row.features)
     return materialized
+
+
+def build_h2h_market_training_rows(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    sport: str,
+    training_cutoff: datetime,
+) -> Tuple[OutcomeTrainingRow, ...]:
+    """Build point-in-time home-win rows from persisted odds and results.
+
+    The latest locally available, coherent home/away quote batch is selected
+    independently for each bookmaker at a fixed 30-minute pregame horizon.
+    At least two complete books are required. Provider corrections are handled
+    by selecting the latest result received by ``training_cutoff``; ties and
+    incomplete markets are excluded instead of inventing binary labels.
+    """
+
+    if not isinstance(sport, str) or not sport.strip():
+        raise ModelDataError("sport must be non-empty")
+    if not _is_aware(training_cutoff):
+        raise ModelDataError("training_cutoff must be timezone-aware")
+
+    events: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ModelDataError("training evidence rows must be mappings")
+        if str(record.get("sport", "")).strip() != sport:
+            continue
+
+        event_id = str(record.get("event_id", "")).strip()
+        home_team = str(record.get("home_team", "")).strip()
+        away_team = str(record.get("away_team", "")).strip()
+        starts_at = record.get("starts_at")
+        if (
+            not event_id
+            or not home_team
+            or not away_team
+            or home_team == away_team
+            or not _is_aware(starts_at)
+        ):
+            raise ModelDataError("persisted event evidence is incomplete")
+        if starts_at >= training_cutoff:
+            continue
+        decision_at = starts_at - PREGAME_H2H_DECISION_LEAD
+
+        event = events.setdefault(
+            event_id,
+            {
+                "starts_at": starts_at,
+                "decision_at": decision_at,
+                "home_team": home_team,
+                "away_team": away_team,
+                "results": {},
+                "quote_batches": {},
+            },
+        )
+        if (
+            event["starts_at"] != starts_at
+            or event["home_team"] != home_team
+            or event["away_team"] != away_team
+        ):
+            raise ModelDataError("persisted event identity changed across evidence rows")
+
+        result_id = str(record.get("result_id", "")).strip()
+        result_received_at = record.get("result_received_at")
+        settled_at = record.get("settled_at")
+        home_score = record.get("home_score")
+        away_score = record.get("away_score")
+        if (
+            result_id
+            and _is_aware(result_received_at)
+            and _is_aware(settled_at)
+            and result_received_at <= training_cutoff
+            and settled_at <= training_cutoff
+        ):
+            if any(isinstance(score, bool) or not isinstance(score, int) or score < 0 for score in (home_score, away_score)):
+                raise ModelDataError("persisted result scores must be non-negative integers")
+            event["results"][result_id] = {
+                "id": result_id,
+                "received_at": result_received_at,
+                "settled_at": settled_at,
+                "home_score": home_score,
+                "away_score": away_score,
+            }
+
+        if str(record.get("market", "")).strip() != "h2h":
+            continue
+        snapshot_id = str(record.get("odds_snapshot_id", "")).strip()
+        provenance_id = str(record.get("primary_provenance_id", "")).strip()
+        bookmaker = str(record.get("bookmaker", "")).strip()
+        selection = str(record.get("selection", "")).strip()
+        captured_at = record.get("captured_at")
+        received_at = record.get("quote_received_at")
+        if not snapshot_id or not provenance_id or not bookmaker:
+            continue
+        if selection not in {home_team, away_team}:
+            continue
+        if not _is_aware(captured_at) or not _is_aware(received_at):
+            raise ModelDataError("persisted quote timestamps must be timezone-aware")
+        if captured_at > decision_at or received_at > decision_at:
+            continue
+        try:
+            decimal_odds = float(record["decimal_odds"])
+            implied_probability(decimal_odds)
+        except (KeyError, TypeError, ValueError):
+            raise ModelDataError("persisted decimal odds are invalid") from None
+
+        batch_key = (bookmaker, provenance_id)
+        batch = event["quote_batches"].setdefault(batch_key, {})
+        candidate = {
+            "snapshot_id": snapshot_id,
+            "captured_at": captured_at,
+            "received_at": received_at,
+            "decimal_odds": decimal_odds,
+        }
+        previous = batch.get(selection)
+        if previous is None or (
+            received_at,
+            captured_at,
+            snapshot_id,
+        ) > (
+            previous["received_at"],
+            previous["captured_at"],
+            previous["snapshot_id"],
+        ):
+            batch[selection] = candidate
+
+    training_rows: List[OutcomeTrainingRow] = []
+    for event_id, event in events.items():
+        if not event["results"]:
+            continue
+        result = max(
+            event["results"].values(),
+            key=lambda item: (item["settled_at"], item["received_at"], item["id"]),
+        )
+        if result["received_at"] < event["starts_at"]:
+            raise ModelDataError("persisted result became available before its event started")
+        if result["home_score"] == result["away_score"]:
+            continue
+
+        complete_by_book: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], str]] = {}
+        for (bookmaker, provenance_id), selections in event["quote_batches"].items():
+            home_quote = selections.get(event["home_team"])
+            away_quote = selections.get(event["away_team"])
+            if home_quote is None or away_quote is None:
+                continue
+            candidate = (home_quote, away_quote, provenance_id)
+            previous = complete_by_book.get(bookmaker)
+            if previous is None or _quote_pair_order(candidate) > _quote_pair_order(previous):
+                complete_by_book[bookmaker] = candidate
+        if len(complete_by_book) < 2:
+            continue
+
+        quote_pairs = list(complete_by_book.values())
+        home_probability, _ = market_consensus_two_way(
+            (home["decimal_odds"], away["decimal_odds"])
+            for home, away, _provenance_id in quote_pairs
+        )
+        source_snapshot_ids = tuple(
+            sorted(
+                quote["snapshot_id"]
+                for home, away, _provenance_id in quote_pairs
+                for quote in (home, away)
+            )
+        )
+        features_available_at = max(
+            quote["received_at"]
+            for home, away, _provenance_id in quote_pairs
+            for quote in (home, away)
+        )
+        training_rows.append(
+            OutcomeTrainingRow(
+                event_id=event_id,
+                event_starts_at=event["starts_at"],
+                decision_at=event["decision_at"],
+                features_available_at=features_available_at,
+                label_available_at=result["received_at"],
+                source_snapshot_ids=source_snapshot_ids,
+                label_source_snapshot_id=result["id"],
+                features={"market_probability": home_probability},
+                outcome=int(result["home_score"] > result["away_score"]),
+            )
+        )
+
+    ordered = tuple(sorted(training_rows, key=lambda row: (row.decision_at, row.event_id)))
+    return validate_training_rows(ordered, PREGAME_H2H_FEATURE_SCHEMA) if ordered else ()
+
+
+def build_h2h_market_prediction_inputs(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    sport: str,
+    now: datetime,
+    released_at: datetime,
+) -> Tuple[PredictionInput, ...]:
+    """Build reproducible live inputs at the same fixed horizon used in training."""
+
+    if not isinstance(sport, str) or not sport.strip():
+        raise ModelDataError("sport must be non-empty")
+    if not _is_aware(now):
+        raise ModelDataError("now must be timezone-aware")
+    if not _is_aware(released_at):
+        raise ModelDataError("released_at must be timezone-aware")
+    if released_at > now:
+        raise ModelDataError("released_at cannot be in the future")
+
+    events: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ModelDataError("prediction evidence rows must be mappings")
+        if str(record.get("sport", "")).strip() != sport:
+            continue
+
+        event_id = str(record.get("event_id", "")).strip()
+        home_team = str(record.get("home_team", "")).strip()
+        away_team = str(record.get("away_team", "")).strip()
+        starts_at = record.get("starts_at")
+        if (
+            not event_id
+            or not home_team
+            or not away_team
+            or home_team == away_team
+            or not _is_aware(starts_at)
+        ):
+            raise ModelDataError("persisted event evidence is incomplete")
+        decision_at = starts_at - PREGAME_H2H_DECISION_LEAD
+        if not released_at <= decision_at <= now < starts_at:
+            continue
+
+        event = events.setdefault(
+            event_id,
+            {
+                "starts_at": starts_at,
+                "decision_at": decision_at,
+                "home_team": home_team,
+                "away_team": away_team,
+                "quote_batches": {},
+            },
+        )
+        if (
+            event["starts_at"] != starts_at
+            or event["home_team"] != home_team
+            or event["away_team"] != away_team
+        ):
+            raise ModelDataError("persisted event identity changed across evidence rows")
+
+        if str(record.get("market", "")).strip() != "h2h":
+            continue
+        snapshot_id = str(record.get("odds_snapshot_id", "")).strip()
+        provenance_id = str(record.get("primary_provenance_id", "")).strip()
+        bookmaker = str(record.get("bookmaker", "")).strip()
+        selection = str(record.get("selection", "")).strip()
+        captured_at = record.get("captured_at")
+        received_at = record.get("quote_received_at")
+        if not snapshot_id or not provenance_id or not bookmaker:
+            continue
+        if selection not in {home_team, away_team}:
+            continue
+        if not _is_aware(captured_at) or not _is_aware(received_at):
+            raise ModelDataError("persisted quote timestamps must be timezone-aware")
+        if captured_at > decision_at or received_at > decision_at:
+            continue
+        try:
+            decimal_odds = float(record["decimal_odds"])
+            implied_probability(decimal_odds)
+        except (KeyError, TypeError, ValueError):
+            raise ModelDataError("persisted decimal odds are invalid") from None
+
+        batch_key = (bookmaker, provenance_id)
+        batch = event["quote_batches"].setdefault(batch_key, {})
+        candidate = {
+            "snapshot_id": snapshot_id,
+            "captured_at": captured_at,
+            "received_at": received_at,
+            "decimal_odds": decimal_odds,
+        }
+        previous = batch.get(selection)
+        if previous is None or (
+            received_at,
+            captured_at,
+            snapshot_id,
+        ) > (
+            previous["received_at"],
+            previous["captured_at"],
+            previous["snapshot_id"],
+        ):
+            batch[selection] = candidate
+
+    inputs: List[PredictionInput] = []
+    for event_id, event in events.items():
+        complete_by_book: Dict[str, Tuple[Dict[str, Any], Dict[str, Any], str]] = {}
+        for (bookmaker, provenance_id), selections in event["quote_batches"].items():
+            home_quote = selections.get(event["home_team"])
+            away_quote = selections.get(event["away_team"])
+            if home_quote is None or away_quote is None:
+                continue
+            candidate = (home_quote, away_quote, provenance_id)
+            previous = complete_by_book.get(bookmaker)
+            if previous is None or _quote_pair_order(candidate) > _quote_pair_order(previous):
+                complete_by_book[bookmaker] = candidate
+        if len(complete_by_book) < 2:
+            continue
+
+        quote_pairs = list(complete_by_book.values())
+        home_probability, _ = market_consensus_two_way(
+            (home["decimal_odds"], away["decimal_odds"])
+            for home, away, _provenance_id in quote_pairs
+        )
+        request = PredictionInput(
+            event_id=event_id,
+            event_starts_at=event["starts_at"],
+            decision_at=event["decision_at"],
+            features_available_at=max(
+                quote["received_at"]
+                for home, away, _provenance_id in quote_pairs
+                for quote in (home, away)
+            ),
+            source_snapshot_ids=tuple(
+                sorted(
+                    quote["snapshot_id"]
+                    for home, away, _provenance_id in quote_pairs
+                    for quote in (home, away)
+                )
+            ),
+            features={"market_probability": home_probability},
+        )
+        validate_prediction_input(request, PREGAME_H2H_FEATURE_SCHEMA)
+        inputs.append(request)
+    return tuple(sorted(inputs, key=lambda request: (request.decision_at, request.event_id)))
+
+
+def load_h2h_market_prediction_inputs(
+    database_url: str,
+    *,
+    sport: str,
+    model_id: str,
+    now: datetime,
+    released_at: datetime,
+    limit: int = 100,
+) -> Tuple[PredictionInput, ...]:
+    """Load unscored upcoming events with receipt-backed pregame market evidence."""
+
+    if not isinstance(database_url, str) or not database_url.strip():
+        raise ModelDataError("database_url must be configured")
+    if not isinstance(sport, str) or not sport.strip():
+        raise ModelDataError("sport must be non-empty")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ModelDataError("model_id must be non-empty")
+    if not _is_aware(now):
+        raise ModelDataError("now must be timezone-aware")
+    if not _is_aware(released_at):
+        raise ModelDataError("released_at must be timezone-aware")
+    if released_at > now:
+        raise ModelDataError("released_at cannot be in the future")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ModelDataError("limit must be an integer from 1 to 1000")
+
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        connection = psycopg.connect(
+            database_url,
+            application_name="sam-analytics-model-inference",
+            connect_timeout=5,
+            options="-c statement_timeout=10000 -c default_transaction_read_only=on",
+            row_factory=dict_row,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH candidate_events AS (
+                        SELECT event.id, event.sport, event.starts_at,
+                               event.home_team, event.away_team
+                        FROM sports_event AS event
+                        WHERE event.sport = %(sport)s
+                          AND event.starts_at > %(now)s
+                          AND event.starts_at - %(decision_lead)s <= %(now)s
+                          AND event.starts_at - %(decision_lead)s >= %(released_at)s
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM prediction
+                              WHERE prediction.event_id = event.id
+                                AND prediction.model_id = %(model_id)s
+                                AND prediction.as_of = event.starts_at - %(decision_lead)s
+                          )
+                        ORDER BY event.starts_at, event.id
+                        LIMIT %(limit)s
+                    ),
+                    eligible_quotes AS (
+                        SELECT event.id AS event_id, event.sport, event.starts_at,
+                               event.home_team, event.away_team,
+                               quote.id AS odds_snapshot_id, quote.bookmaker,
+                               quote.primary_provenance_id, quote.market, quote.selection,
+                               quote.decimal_odds, quote.captured_at,
+                               quote.received_at AS quote_received_at
+                        FROM candidate_events AS event
+                        JOIN odds_snapshot AS quote ON quote.event_id = event.id
+                        JOIN raw_data_provenance AS provenance
+                          ON provenance.id = quote.primary_provenance_id
+                        JOIN provider_payload_receipt AS receipt
+                          ON receipt.id = provenance.provider_payload_receipt_id
+                        WHERE quote.market = 'h2h'
+                          AND quote.line IS NULL
+                          AND quote.bookmaker IS NOT NULL
+                          AND quote.selection IN (event.home_team, event.away_team)
+                          AND quote.captured_at <= event.starts_at - %(decision_lead)s
+                          AND quote.received_at <= event.starts_at - %(decision_lead)s
+                          AND provenance.source_type = 'odds'
+                          AND provenance.payload_sha256 = quote.source_payload_sha256
+                          AND provenance.received_at = quote.received_at
+                          AND receipt.provider = quote.provider
+                          AND receipt.source_type = 'odds'
+                          AND receipt.payload_sha256 = quote.source_payload_sha256
+                          AND receipt.received_at = quote.received_at
+                    ),
+                    latest_batch_selections AS (
+                        SELECT DISTINCT ON (
+                                   event_id, bookmaker, primary_provenance_id, selection
+                               )
+                               *
+                        FROM eligible_quotes
+                        ORDER BY event_id, bookmaker, primary_provenance_id, selection,
+                                 quote_received_at DESC, captured_at DESC,
+                                 odds_snapshot_id DESC
+                    ),
+                    complete_batches AS (
+                        SELECT event_id, bookmaker, primary_provenance_id,
+                               max(quote_received_at) AS pair_received_at,
+                               max(captured_at) AS pair_captured_at
+                        FROM latest_batch_selections
+                        GROUP BY event_id, bookmaker, primary_provenance_id
+                        HAVING count(*) = 2
+                    ),
+                    selected_batches AS (
+                        SELECT DISTINCT ON (event_id, bookmaker)
+                               event_id, bookmaker, primary_provenance_id
+                        FROM complete_batches
+                        ORDER BY event_id, bookmaker, pair_received_at DESC,
+                                 pair_captured_at DESC, primary_provenance_id DESC
+                    )
+                    SELECT quote.event_id, quote.sport, quote.starts_at,
+                           quote.home_team, quote.away_team,
+                           quote.odds_snapshot_id, quote.bookmaker,
+                           quote.primary_provenance_id, quote.market, quote.selection,
+                           quote.decimal_odds, quote.captured_at,
+                           quote.quote_received_at
+                    FROM latest_batch_selections AS quote
+                    JOIN selected_batches AS selected
+                      ON selected.event_id = quote.event_id
+                     AND selected.bookmaker = quote.bookmaker
+                     AND selected.primary_provenance_id = quote.primary_provenance_id
+                    ORDER BY quote.starts_at, quote.event_id, quote.bookmaker,
+                             quote.quote_received_at, quote.captured_at,
+                             quote.odds_snapshot_id
+                    """,
+                    {
+                        "sport": sport,
+                        "model_id": model_id,
+                        "now": now,
+                        "released_at": released_at,
+                        "decision_lead": PREGAME_H2H_DECISION_LEAD,
+                        "limit": limit,
+                    },
+                )
+                records = tuple(cursor.fetchall())
+        finally:
+            connection.close()
+    except Exception as error:
+        if isinstance(error, ModelDataError):
+            raise
+        raise ModelTrainingError("persisted prediction evidence could not be loaded") from None
+    return build_h2h_market_prediction_inputs(
+        records,
+        sport=sport,
+        now=now,
+        released_at=released_at,
+    )
+
+
+def load_h2h_market_training_rows(
+    database_url: str,
+    *,
+    sport: str,
+    training_cutoff: datetime,
+) -> Tuple[OutcomeTrainingRow, ...]:
+    """Load the immutable PostgreSQL evidence needed by the model evaluator."""
+
+    if not isinstance(database_url, str) or not database_url.strip():
+        raise ModelDataError("database_url must be configured")
+    if not isinstance(sport, str) or not sport.strip():
+        raise ModelDataError("sport must be non-empty")
+    if not _is_aware(training_cutoff):
+        raise ModelDataError("training_cutoff must be timezone-aware")
+
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        connection = psycopg.connect(
+            database_url,
+            application_name="sam-analytics-model-training",
+            connect_timeout=5,
+            options="-c statement_timeout=30000 -c default_transaction_read_only=on",
+            row_factory=dict_row,
+        )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH latest_results AS (
+                        SELECT DISTINCT ON (result.event_id)
+                               result.id, result.event_id, result.settled_at,
+                               result.received_at, result.home_score, result.away_score
+                        FROM event_result AS result
+                        JOIN sports_event AS result_event ON result_event.id = result.event_id
+                        WHERE result.provider = result_event.provider
+                          AND result_event.sport = %(sport)s
+                          AND result.received_at <= %(training_cutoff)s
+                          AND result.settled_at <= %(training_cutoff)s
+                          AND result.settled_at >= result_event.starts_at
+                          AND EXISTS (
+                              SELECT 1
+                              FROM event_result_provenance AS result_link
+                              JOIN raw_data_provenance AS result_provenance
+                                ON result_provenance.id = result_link.provenance_id
+                              JOIN provider_payload_receipt AS result_receipt
+                                ON result_receipt.id = result_provenance.provider_payload_receipt_id
+                              WHERE result_link.event_result_id = result.id
+                                AND result_provenance.provider = result.provider
+                                AND result_provenance.source_type = 'result'
+                                AND result_provenance.payload_sha256 = result.source_payload_sha256
+                                AND result_provenance.received_at = result.received_at
+                                AND result_receipt.provider = result.provider
+                                AND result_receipt.source_type = 'result'
+                                AND result_receipt.payload_sha256 = result.source_payload_sha256
+                                AND result_receipt.received_at = result.received_at
+                          )
+                        ORDER BY result.event_id, result.settled_at DESC,
+                                 result.received_at DESC, result.id DESC
+                    ),
+                    eligible_quotes AS (
+                        SELECT event.id AS event_id, event.sport, event.starts_at,
+                               event.home_team, event.away_team,
+                               quote.id AS odds_snapshot_id, quote.bookmaker,
+                               quote.primary_provenance_id, quote.market, quote.selection,
+                               quote.decimal_odds, quote.captured_at,
+                               quote.received_at AS quote_received_at,
+                               result.id AS result_id, result.settled_at,
+                               result.received_at AS result_received_at,
+                               result.home_score, result.away_score
+                        FROM sports_event AS event
+                        JOIN latest_results AS result ON result.event_id = event.id
+                        JOIN odds_snapshot AS quote ON quote.event_id = event.id
+                        WHERE event.sport = %(sport)s
+                          AND event.starts_at < %(training_cutoff)s
+                          AND quote.market = 'h2h'
+                          AND quote.line IS NULL
+                          AND quote.bookmaker IS NOT NULL
+                          AND quote.primary_provenance_id IS NOT NULL
+                          AND quote.selection IN (event.home_team, event.away_team)
+                          AND quote.captured_at <= event.starts_at - %(decision_lead)s
+                          AND quote.received_at <= event.starts_at - %(decision_lead)s
+                    ),
+                    latest_batch_selections AS (
+                        SELECT DISTINCT ON (
+                                   event_id, bookmaker, primary_provenance_id, selection
+                               )
+                               *
+                        FROM eligible_quotes
+                        ORDER BY event_id, bookmaker, primary_provenance_id, selection,
+                                 quote_received_at DESC, captured_at DESC,
+                                 odds_snapshot_id DESC
+                    ),
+                    complete_batches AS (
+                        SELECT event_id, bookmaker, primary_provenance_id,
+                               max(quote_received_at) AS pair_received_at,
+                               max(captured_at) AS pair_captured_at
+                        FROM latest_batch_selections
+                        GROUP BY event_id, bookmaker, primary_provenance_id
+                        HAVING count(*) = 2
+                    ),
+                    selected_batches AS (
+                        SELECT DISTINCT ON (event_id, bookmaker)
+                               event_id, bookmaker, primary_provenance_id
+                        FROM complete_batches
+                        ORDER BY event_id, bookmaker, pair_received_at DESC,
+                                 pair_captured_at DESC, primary_provenance_id DESC
+                    )
+                    SELECT quote.event_id, quote.sport, quote.starts_at,
+                           quote.home_team, quote.away_team,
+                           quote.odds_snapshot_id, quote.bookmaker,
+                           quote.primary_provenance_id, quote.market, quote.selection,
+                           quote.decimal_odds, quote.captured_at,
+                           quote.quote_received_at, quote.result_id,
+                           quote.settled_at, quote.result_received_at,
+                           quote.home_score, quote.away_score
+                    FROM latest_batch_selections AS quote
+                    JOIN selected_batches AS selected
+                      ON selected.event_id = quote.event_id
+                     AND selected.bookmaker = quote.bookmaker
+                     AND selected.primary_provenance_id = quote.primary_provenance_id
+                    ORDER BY quote.starts_at, quote.event_id, quote.bookmaker,
+                             quote.quote_received_at, quote.captured_at,
+                             quote.odds_snapshot_id
+                    """,
+                    {
+                        "sport": sport,
+                        "training_cutoff": training_cutoff,
+                        "decision_lead": PREGAME_H2H_DECISION_LEAD,
+                    },
+                )
+                records = tuple(cursor.fetchall())
+        finally:
+            connection.close()
+    except Exception as error:
+        if isinstance(error, ModelDataError):
+            raise
+        raise ModelTrainingError("persisted training evidence could not be loaded") from None
+    return build_h2h_market_training_rows(
+        records,
+        sport=sport,
+        training_cutoff=training_cutoff,
+    )
+
+
+def _quote_pair_order(
+    pair: Tuple[Dict[str, Any], Dict[str, Any], str],
+) -> Tuple[datetime, datetime, str]:
+    home, away, provenance_id = pair
+    return (
+        max(home["received_at"], away["received_at"]),
+        max(home["captured_at"], away["captured_at"]),
+        provenance_id,
+    )
 
 
 def _data_contract_components() -> Dict[str, Any]:

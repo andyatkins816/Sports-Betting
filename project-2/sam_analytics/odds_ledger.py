@@ -1,10 +1,10 @@
-"""Transactional, evidence-first persistence for licensed pregame odds.
+"""Transactional, evidence-first persistence for licensed odds and results.
 
 This module is deliberately *not* a scheduler or a provider client.  A caller
-first obtains a complete provider response, builds :class:`PreparedOddsPayload`,
-and hands it to this ledger.  The ledger then enforces the important ordering:
+first obtains a complete provider response, prepares it, and hands it to this
+ledger.  The ledger then enforces the important ordering:
 
-1. validate the approved provider contract and every pregame quote;
+1. validate the approved provider contract and every admitted observation;
 2. put the unmodified response in private, content-addressed storage;
 3. atomically write the receipt, raw provenance, event identities, snapshots,
    provenance links, and a safe operational signal to PostgreSQL.
@@ -22,8 +22,8 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Protocol
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sam_analytics.data_contracts import (
     RawDataProvenance,
@@ -41,6 +41,9 @@ from sam_analytics.raw_payload_store import (
     StoredRawPayload,
     validate_private_payload_uri,
 )
+
+if TYPE_CHECKING:
+    from sam_analytics.providers.the_odds_api import CompletedScore
 
 
 _SENSITIVE_SCOPE_NAMES = frozenset(
@@ -94,30 +97,44 @@ class PreparedOddsPayload:
 
     @property
     def request_fingerprint_sha256(self) -> str:
-        return _canonical_sha256(dict(_validated_request_scope(self.request_scope)))
+        return _payload_request_fingerprint(self)
 
     @property
     def receipt_sha256(self) -> str:
         """Stable identity for this exact provider receipt, without its body."""
 
-        return _canonical_sha256(
-            {
-                "provider": self.provider,
-                "source_type": self.source_type,
-                "request_fingerprint_sha256": self.request_fingerprint_sha256,
-                "payload_sha256": hashlib.sha256(self.raw_payload).hexdigest(),
-                "captured_at": _utc(self.captured_at),
-                "received_at": _utc(self.received_at),
-                "provider_response_status": self.provider_response_status,
-                "payload_bytes": len(self.raw_payload),
-                "requests_remaining": self.requests_remaining,
-                "requests_used": self.requests_used,
-                "request_cost": self.request_cost,
-                "schema_version": self.schema_version,
-                "license_scope": self.license_scope,
-                "license_version": self.license_version,
-            }
-        )
+        return _payload_receipt_sha256(self)
+
+
+@dataclass(frozen=True)
+class PreparedResultsPayload:
+    """One complete scores response ready for immutable result persistence."""
+
+    provider: str
+    source_type: str
+    raw_payload: bytes
+    captured_at: datetime
+    received_at: datetime
+    schema_version: str
+    license_scope: str
+    license_version: str
+    scores: tuple[CompletedScore, ...]
+    request_scope: tuple[tuple[str, str], ...] = ()
+    provider_response_status: int = 200
+    requests_remaining: int | None = None
+    requests_used: int | None = None
+    request_cost: int | None = None
+    content_type: str = "application/json"
+
+    @property
+    def request_fingerprint_sha256(self) -> str:
+        return _payload_request_fingerprint(self)
+
+    @property
+    def receipt_sha256(self) -> str:
+        """Stable identity for this exact provider receipt, without its body."""
+
+        return _payload_receipt_sha256(self)
 
 
 @dataclass(frozen=True)
@@ -130,6 +147,20 @@ class LedgerWriteResult:
     events_created: int
     snapshots_created: int
     snapshots_replayed: int
+    provenance_links_created: int
+    incidents_created: int
+
+
+@dataclass(frozen=True)
+class ResultsLedgerWriteResult:
+    """Credential-safe outcome of one attempted completed-results write."""
+
+    status: str
+    receipt_sha256: str
+    provenance_sha256: str
+    events_created: int
+    results_created: int
+    results_replayed: int
     provenance_links_created: int
     incidents_created: int
 
@@ -152,7 +183,7 @@ class _Cursor(Protocol):
     def fetchone(self) -> Sequence[Any] | None:
         ...
 
-    def __enter__(self) -> "_Cursor":
+    def __enter__(self) -> _Cursor:
         ...
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
@@ -201,7 +232,7 @@ class OddsLedger:
         but can never create a database fact that lacks retained raw evidence.
         """
 
-        validation_time = now or datetime.now(timezone.utc)
+        validation_time = now or datetime.now(UTC)
         _validate_prepared_payload(payload, now=validation_time)
         provider_use = self._authorize(payload)
         try:
@@ -209,7 +240,60 @@ class OddsLedger:
         except ValueError:
             raise OddsLedgerValidationError("provider quotes failed pregame validation") from None
         event_identities = _event_identities(normalized_quotes)
+        stored_payload, provenance = self._retain_raw_evidence(
+            payload,
+            provider_use=provider_use,
+            validation_time=validation_time,
+        )
 
+        return self._write_transaction(
+            payload=payload,
+            stored_payload=stored_payload,
+            provenance=provenance,
+            normalized_quotes=normalized_quotes,
+            event_identities=event_identities,
+        )
+
+    def persist_results(
+        self, payload: PreparedResultsPayload, *, now: datetime | None = None
+    ) -> ResultsLedgerWriteResult:
+        """Write completed scores only after retaining their raw provider response."""
+
+        validation_time = now or datetime.now(UTC)
+        _validate_prepared_results_payload(payload, now=validation_time)
+        provider_use = self._authorize(payload)
+        event_identities = _result_event_identities(payload.scores)
+        stored_payload, provenance = self._retain_raw_evidence(
+            payload,
+            provider_use=provider_use,
+            validation_time=validation_time,
+        )
+
+        return self._write_results_transaction(
+            payload=payload,
+            stored_payload=stored_payload,
+            provenance=provenance,
+            event_identities=event_identities,
+        )
+
+    def _authorize(self, payload: PreparedOddsPayload | PreparedResultsPayload) -> ProviderUse:
+        try:
+            return self._provider_contracts.authorize_ingestion(
+                provider=payload.provider,
+                license_scope=payload.license_scope,
+                license_version=payload.license_version,
+                source_type=payload.source_type,
+            )
+        except ValueError:
+            raise OddsLedgerValidationError("provider contract does not authorize this ingestion") from None
+
+    def _retain_raw_evidence(
+        self,
+        payload: PreparedOddsPayload | PreparedResultsPayload,
+        *,
+        provider_use: ProviderUse,
+        validation_time: datetime,
+    ) -> tuple[StoredRawPayload, RawDataProvenance]:
         metadata = RawPayloadMetadata(
             provider=payload.provider,
             provider_record_id=f"receipt:{payload.receipt_sha256}",
@@ -224,7 +308,9 @@ class OddsLedger:
         try:
             validate_private_payload_metadata_for_use(metadata, provider_use)
         except ValueError:
-            raise OddsLedgerValidationError("raw payload metadata is not authorized for this provider") from None
+            raise OddsLedgerValidationError(
+                "raw payload metadata is not authorized for this provider"
+            ) from None
         stored_payload = self._store_raw_payload(payload.raw_payload, metadata)
         provenance = RawDataProvenance(
             provider=payload.provider,
@@ -243,26 +329,7 @@ class OddsLedger:
             )
         except ValueError:
             raise OddsLedgerValidationError("raw provider evidence failed validation") from None
-
-        return self._write_transaction(
-            payload=payload,
-            provider_use=provider_use,
-            stored_payload=stored_payload,
-            provenance=provenance,
-            normalized_quotes=normalized_quotes,
-            event_identities=event_identities,
-        )
-
-    def _authorize(self, payload: PreparedOddsPayload) -> ProviderUse:
-        try:
-            return self._provider_contracts.authorize_ingestion(
-                provider=payload.provider,
-                license_scope=payload.license_scope,
-                license_version=payload.license_version,
-                source_type=payload.source_type,
-            )
-        except ValueError:
-            raise OddsLedgerValidationError("provider contract does not authorize this ingestion") from None
+        return stored_payload, provenance
 
     def _store_raw_payload(
         self, raw_payload: bytes, metadata: RawPayloadMetadata
@@ -293,7 +360,6 @@ class OddsLedger:
         self,
         *,
         payload: PreparedOddsPayload,
-        provider_use: ProviderUse,
         stored_payload: StoredRawPayload,
         provenance: RawDataProvenance,
         normalized_quotes: tuple[NormalizedQuote, ...],
@@ -315,9 +381,12 @@ class OddsLedger:
                             payload=payload,
                             provenance=provenance,
                             status="blocked_event_identity",
-                            snapshots_created=0,
-                            snapshots_replayed=0,
-                            incidents_created=len(conflicts),
+                            source="odds_ledger",
+                            counters={
+                                "snapshots_created": 0,
+                                "snapshots_replayed": 0,
+                                "incidents_created": len(conflicts),
+                            },
                         )
                         return LedgerWriteResult(
                             status="blocked_event_identity",
@@ -344,9 +413,12 @@ class OddsLedger:
                         payload=payload,
                         provenance=provenance,
                         status=status,
-                        snapshots_created=created,
-                        snapshots_replayed=replayed,
-                        incidents_created=0,
+                        source="odds_ledger",
+                        counters={
+                            "snapshots_created": created,
+                            "snapshots_replayed": replayed,
+                            "incidents_created": 0,
+                        },
                     )
                     return LedgerWriteResult(
                         status=status,
@@ -368,6 +440,96 @@ class OddsLedger:
                     connection.close()
                 except Exception:
                     raise OddsLedgerUnavailable("odds evidence ledger connection cleanup failed") from None
+
+    def _write_results_transaction(
+        self,
+        *,
+        payload: PreparedResultsPayload,
+        stored_payload: StoredRawPayload,
+        provenance: RawDataProvenance,
+        event_identities: tuple[_EventIdentity, ...],
+    ) -> ResultsLedgerWriteResult:
+        connection: _Connection | None = None
+        try:
+            connection = self._connection_factory(self._database_url)
+            with connection.transaction():
+                with connection.cursor() as cursor:
+                    receipt_id = _insert_or_select_receipt(cursor, payload, stored_payload)
+                    provenance_id = _insert_or_select_provenance(cursor, provenance, receipt_id)
+                    event_ids, events_created, conflicts = _ensure_event_identities(
+                        cursor,
+                        event_identities,
+                        allow_schedule_drift=True,
+                    )
+                    if conflicts:
+                        for conflict in conflicts:
+                            _insert_event_identity_incident(cursor, conflict, provenance.provider)
+                        _insert_provider_signal(
+                            cursor,
+                            payload=payload,
+                            provenance=provenance,
+                            status="blocked_event_identity",
+                            source="results_ledger",
+                            counters={
+                                "results_created": 0,
+                                "results_replayed": 0,
+                                "incidents_created": len(conflicts),
+                            },
+                        )
+                        return ResultsLedgerWriteResult(
+                            status="blocked_event_identity",
+                            receipt_sha256=payload.receipt_sha256,
+                            provenance_sha256=provenance.digest,
+                            events_created=events_created,
+                            results_created=0,
+                            results_replayed=0,
+                            provenance_links_created=0,
+                            incidents_created=len(conflicts),
+                        )
+
+                    created, replayed, links_created = _insert_event_results(
+                        cursor,
+                        scores=payload.scores,
+                        event_ids=event_ids,
+                        provenance_id=provenance_id,
+                        payload_sha256=stored_payload.payload_sha256,
+                        received_at=payload.received_at,
+                    )
+                    status = "accepted" if payload.scores else "accepted_empty"
+                    _insert_provider_signal(
+                        cursor,
+                        payload=payload,
+                        provenance=provenance,
+                        status=status,
+                        source="results_ledger",
+                        counters={
+                            "results_created": created,
+                            "results_replayed": replayed,
+                            "incidents_created": 0,
+                        },
+                    )
+                    return ResultsLedgerWriteResult(
+                        status=status,
+                        receipt_sha256=payload.receipt_sha256,
+                        provenance_sha256=provenance.digest,
+                        events_created=events_created,
+                        results_created=created,
+                        results_replayed=replayed,
+                        provenance_links_created=links_created,
+                        incidents_created=0,
+                    )
+        except OddsLedgerError:
+            raise
+        except Exception:
+            raise OddsLedgerUnavailable("result evidence ledger database transaction failed") from None
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    raise OddsLedgerUnavailable(
+                        "result evidence ledger connection cleanup failed"
+                    ) from None
 
 
 def prepare_the_odds_api_payload(
@@ -437,6 +599,64 @@ def prepare_the_odds_api_payload(
     )
 
 
+def prepare_the_odds_api_results_payload(
+    fetch: Any,
+    *,
+    license_scope: str,
+    license_version: str,
+    source_type: str = "result",
+    schema_version: str = "v4",
+) -> PreparedResultsPayload:
+    """Convert one already-fetched Odds API scores response into private evidence."""
+
+    from sam_analytics.providers.the_odds_api import CompletedScore
+
+    raw_payload = getattr(fetch, "raw_payload", None)
+    received_at = getattr(fetch, "received_at", None)
+    scores = getattr(fetch, "scores", None)
+    scope = getattr(fetch, "request_scope", None)
+    if not isinstance(raw_payload, bytes) or not raw_payload:
+        raise OddsLedgerValidationError("provider fetch does not contain raw response bytes")
+    if not _aware(received_at):
+        raise OddsLedgerValidationError("provider fetch does not contain a local receipt time")
+    if not isinstance(scores, tuple) or not all(
+        isinstance(score, CompletedScore) for score in scores
+    ):
+        raise OddsLedgerValidationError("provider fetch does not contain valid completed scores")
+    _validated_completed_scores(scores, provider="the_odds_api")
+    if scope is None:
+        raise OddsLedgerValidationError("provider fetch does not contain a sanitized request scope")
+    sport_key = getattr(scope, "sport_key", None)
+    days_from = getattr(scope, "days_from", None)
+    if (
+        not _nonempty_text(sport_key)
+        or isinstance(days_from, bool)
+        or not isinstance(days_from, int)
+        or not 1 <= days_from <= 3
+    ):
+        raise OddsLedgerValidationError("provider fetch request scope is incomplete")
+    if any(score.sport != sport_key for score in scores):
+        raise OddsLedgerValidationError("provider scores do not match the requested sport")
+
+    captured_at = max((score.last_update for score in scores), default=received_at)
+    return PreparedResultsPayload(
+        provider="the_odds_api",
+        source_type=source_type,
+        raw_payload=raw_payload,
+        captured_at=captured_at,
+        received_at=received_at,
+        schema_version=schema_version,
+        license_scope=license_scope,
+        license_version=license_version,
+        scores=scores,
+        request_scope=(("sport_key", sport_key), ("days_from", str(days_from))),
+        provider_response_status=200,
+        requests_remaining=getattr(fetch, "requests_remaining", None),
+        requests_used=getattr(fetch, "requests_used", None),
+        request_cost=getattr(fetch, "request_cost", None),
+    )
+
+
 def _connect_postgres(database_url: str) -> _Connection:
     try:
         import psycopg
@@ -454,9 +674,25 @@ def _connect_postgres(database_url: str) -> _Connection:
 def _validate_prepared_payload(payload: PreparedOddsPayload, *, now: datetime) -> None:
     if not isinstance(payload, PreparedOddsPayload):
         raise OddsLedgerValidationError("prepared odds payload is required")
+    _validate_payload_envelope(payload, now=now, kind="odds")
+    if not isinstance(payload.quotes, tuple) or not all(
+        isinstance(quote, RawOddsQuote) for quote in payload.quotes
+    ):
+        raise OddsLedgerValidationError(
+            "a provider payload must contain a valid pregame quote collection"
+        )
+    _validated_request_scope(payload.request_scope)
+
+
+def _validate_payload_envelope(
+    payload: PreparedOddsPayload | PreparedResultsPayload,
+    *,
+    now: datetime,
+    kind: str,
+) -> None:
     for field in ("provider", "source_type", "schema_version", "license_scope", "license_version", "content_type"):
         if not _nonempty_text(getattr(payload, field)):
-            raise OddsLedgerValidationError("prepared odds payload has a required empty field")
+            raise OddsLedgerValidationError(f"prepared {kind} payload has a required empty field")
     if not isinstance(payload.raw_payload, bytes) or not payload.raw_payload:
         raise OddsLedgerValidationError("provider response must be non-empty bytes")
     if not _aware(payload.captured_at) or not _aware(payload.received_at) or not _aware(now):
@@ -470,11 +706,50 @@ def _validate_prepared_payload(payload: PreparedOddsPayload, *, now: datetime) -
     for value in (payload.requests_remaining, payload.requests_used, payload.request_cost):
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
             raise OddsLedgerValidationError("provider quota values must be non-negative integers or None")
-    if not isinstance(payload.quotes, tuple) or not all(
-        isinstance(quote, RawOddsQuote) for quote in payload.quotes
-    ):
-        raise OddsLedgerValidationError("a provider payload must contain a valid pregame quote collection")
+
+
+def _validate_prepared_results_payload(
+    payload: PreparedResultsPayload, *, now: datetime
+) -> None:
+    if not isinstance(payload, PreparedResultsPayload):
+        raise OddsLedgerValidationError("prepared results payload is required")
+    _validate_payload_envelope(payload, now=now, kind="results")
+    scores = _validated_completed_scores(payload.scores, provider=payload.provider)
+    if any(score.last_update > payload.received_at + _MAX_PROVIDER_CLOCK_SKEW for score in scores):
+        raise OddsLedgerValidationError("provider result update is after local receipt")
     _validated_request_scope(payload.request_scope)
+
+
+def _validated_completed_scores(
+    scores: object, *, provider: str
+) -> tuple[CompletedScore, ...]:
+    from sam_analytics.providers.the_odds_api import CompletedScore
+
+    if not isinstance(scores, tuple) or not all(
+        isinstance(score, CompletedScore) for score in scores
+    ):
+        raise OddsLedgerValidationError("a provider payload must contain valid completed scores")
+    provider_events: set[tuple[str, str]] = set()
+    for score in scores:
+        for field in ("provider", "event_id", "sport", "league", "home_team", "away_team"):
+            if not _nonempty_text(getattr(score, field)):
+                raise OddsLedgerValidationError("completed score is missing event metadata")
+        if score.provider != provider:
+            raise OddsLedgerValidationError("completed score provider does not match its payload")
+        if score.home_team == score.away_team:
+            raise OddsLedgerValidationError("completed score teams must be distinct")
+        if not _aware(score.commence_time) or not _aware(score.last_update):
+            raise OddsLedgerValidationError("completed score timestamps must be timezone-aware")
+        if score.last_update < score.commence_time:
+            raise OddsLedgerValidationError("completed score update cannot predate event start")
+        for value in (score.home_score, score.away_score):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise OddsLedgerValidationError("completed scores must be non-negative integers")
+        event_key = (score.provider, score.event_id)
+        if event_key in provider_events:
+            raise OddsLedgerValidationError("provider payload contains duplicate completed events")
+        provider_events.add(event_key)
+    return scores
 
 
 def _validated_request_scope(scope: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
@@ -524,8 +799,25 @@ def _event_identities(quotes: tuple[NormalizedQuote, ...]) -> tuple[_EventIdenti
     return tuple(identities.values())
 
 
+def _result_event_identities(scores: tuple[CompletedScore, ...]) -> tuple[_EventIdentity, ...]:
+    return tuple(
+        _EventIdentity(
+            provider=score.provider,
+            provider_event_id=score.event_id,
+            sport=score.sport,
+            league=score.league,
+            starts_at=score.commence_time,
+            home_team=score.home_team,
+            away_team=score.away_team,
+        )
+        for score in scores
+    )
+
+
 def _insert_or_select_receipt(
-    cursor: _Cursor, payload: PreparedOddsPayload, stored_payload: StoredRawPayload
+    cursor: _Cursor,
+    payload: PreparedOddsPayload | PreparedResultsPayload,
+    stored_payload: StoredRawPayload,
 ) -> Any:
     cursor.execute(
         """
@@ -607,7 +899,10 @@ def _insert_or_select_provenance(
 
 
 def _ensure_event_identities(
-    cursor: _Cursor, identities: tuple[_EventIdentity, ...]
+    cursor: _Cursor,
+    identities: tuple[_EventIdentity, ...],
+    *,
+    allow_schedule_drift: bool = False,
 ) -> tuple[dict[tuple[str, str], Any], int, tuple[_EventIdentity, ...]]:
     event_ids: dict[tuple[str, str], Any] = {}
     conflicts: list[_EventIdentity] = []
@@ -649,14 +944,19 @@ def _ensure_event_identities(
         if existing is None:
             raise OddsLedgerUnavailable("event identity could not be read after insert")
         event_ids[(identity.provider, identity.provider_event_id)] = existing[0]
-        candidate_fields = (
-            identity.sport,
-            identity.league,
-            identity.starts_at,
-            identity.home_team,
-            identity.away_team,
-        )
-        if tuple(existing[1:]) != candidate_fields:
+        if allow_schedule_drift:
+            candidate_fields = (identity.sport, identity.home_team, identity.away_team)
+            existing_fields = (existing[1], existing[4], existing[5])
+        else:
+            candidate_fields = (
+                identity.sport,
+                identity.league,
+                identity.starts_at,
+                identity.home_team,
+                identity.away_team,
+            )
+            existing_fields = tuple(existing[1:])
+        if existing_fields != candidate_fields:
             conflicts.append(identity)
     return event_ids, created, tuple(conflicts)
 
@@ -750,15 +1050,86 @@ def _insert_odds_snapshots(
     return created, replayed, provenance_links_created
 
 
+def _insert_event_results(
+    cursor: _Cursor,
+    *,
+    scores: tuple[CompletedScore, ...],
+    event_ids: Mapping[tuple[str, str], Any],
+    provenance_id: Any,
+    payload_sha256: str,
+    received_at: datetime,
+) -> tuple[int, int, int]:
+    created = 0
+    replayed = 0
+    provenance_links_created = 0
+    for score in scores:
+        event_id = event_ids[(score.provider, score.event_id)]
+        provider_result_id = _provider_result_id(score)
+        cursor.execute(
+            """
+            INSERT INTO event_result (
+                event_id, provider, provider_result_id, settled_at, home_score,
+                away_score, source_payload_sha256, received_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (provider, provider_result_id) DO NOTHING
+            RETURNING id
+            """,
+            (
+                event_id,
+                score.provider,
+                provider_result_id,
+                score.last_update,
+                score.home_score,
+                score.away_score,
+                payload_sha256,
+                received_at,
+            ),
+        )
+        result = cursor.fetchone()
+        if result is None:
+            replayed += 1
+            cursor.execute(
+                "SELECT id FROM event_result WHERE provider = %s AND provider_result_id = %s",
+                (score.provider, provider_result_id),
+            )
+            result = cursor.fetchone()
+            if result is None:
+                raise OddsLedgerUnavailable("event result could not be read after insert")
+        else:
+            created += 1
+        cursor.execute(
+            """
+            INSERT INTO event_result_provenance (event_result_id, provenance_id)
+            VALUES (%s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING event_result_id
+            """,
+            (result[0], provenance_id),
+        )
+        if cursor.fetchone() is not None:
+            provenance_links_created += 1
+    return created, replayed, provenance_links_created
+
+
+def _provider_result_id(score: CompletedScore) -> str:
+    return _canonical_sha256(
+        {
+            "provider_event_id": score.event_id,
+            "last_update": _utc(score.last_update),
+            "home_score": score.home_score,
+            "away_score": score.away_score,
+        }
+    )
+
+
 def _insert_provider_signal(
     cursor: _Cursor,
     *,
-    payload: PreparedOddsPayload,
+    payload: PreparedOddsPayload | PreparedResultsPayload,
     provenance: RawDataProvenance,
     status: str,
-    snapshots_created: int,
-    snapshots_replayed: int,
-    incidents_created: int,
+    source: str,
+    counters: Mapping[str, int],
 ) -> None:
     safe_signal = {
         "status": status,
@@ -766,13 +1137,11 @@ def _insert_provider_signal(
         "schema_version": payload.schema_version,
         "license_scope": payload.license_scope,
         "license_version": payload.license_version,
-        "snapshots_created": snapshots_created,
-        "snapshots_replayed": snapshots_replayed,
-        "incidents_created": incidents_created,
         "requests_remaining": payload.requests_remaining,
         "requests_used": payload.requests_used,
         "request_cost": payload.request_cost,
     }
+    safe_signal.update(counters)
     cursor.execute(
         """
         INSERT INTO operational_signal (
@@ -783,7 +1152,7 @@ def _insert_provider_signal(
             "provider",
             payload.captured_at,
             payload.received_at,
-            "odds_ledger",
+            source,
             provenance.digest,
             json.dumps(safe_signal, sort_keys=True),
         ),
@@ -796,12 +1165,39 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
+def _payload_request_fingerprint(
+    payload: PreparedOddsPayload | PreparedResultsPayload,
+) -> str:
+    return _canonical_sha256(dict(_validated_request_scope(payload.request_scope)))
+
+
+def _payload_receipt_sha256(payload: PreparedOddsPayload | PreparedResultsPayload) -> str:
+    return _canonical_sha256(
+        {
+            "provider": payload.provider,
+            "source_type": payload.source_type,
+            "request_fingerprint_sha256": payload.request_fingerprint_sha256,
+            "payload_sha256": hashlib.sha256(payload.raw_payload).hexdigest(),
+            "captured_at": _utc(payload.captured_at),
+            "received_at": _utc(payload.received_at),
+            "provider_response_status": payload.provider_response_status,
+            "payload_bytes": len(payload.raw_payload),
+            "requests_remaining": payload.requests_remaining,
+            "requests_used": payload.requests_used,
+            "request_cost": payload.request_cost,
+            "schema_version": payload.schema_version,
+            "license_scope": payload.license_scope,
+            "license_version": payload.license_version,
+        }
+    )
+
+
 def _aware(value: object) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
 def _utc(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _nonempty_text(value: object) -> bool:

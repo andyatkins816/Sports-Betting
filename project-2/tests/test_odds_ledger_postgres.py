@@ -7,18 +7,19 @@ which proves that the Python transaction and database integrity triggers agree.
 
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
-from sam_analytics.odds_ledger import OddsLedger, PreparedOddsPayload
+from sam_analytics.modeling import load_h2h_market_training_rows
+from sam_analytics.odds_ledger import OddsLedger, PreparedOddsPayload, PreparedResultsPayload
 from sam_analytics.provider_contracts import ApprovedProviderContract, ProviderContractRegistry
+from sam_analytics.providers.the_odds_api import CompletedScore
 from sam_analytics.raw_payload_store import InMemoryRawPayloadStore
-
 
 _DATABASE_URL = os.getenv("DATABASE_URL")
 _PSYCOPG_AVAILABLE = importlib.util.find_spec("psycopg") is not None
@@ -27,7 +28,7 @@ _PSYCOPG_AVAILABLE = importlib.util.find_spec("psycopg") is not None
 @unittest.skipUnless(_DATABASE_URL and _PSYCOPG_AVAILABLE, "requires disposable PostgreSQL")
 class OddsLedgerPostgresTests(unittest.TestCase):
     def setUp(self):
-        self.now = datetime.now(timezone.utc)
+        self.now = datetime.now(UTC)
         self.event_id = f"ci-event-{uuid4().hex}"
         self.contracts = ProviderContractRegistry(
             [
@@ -35,7 +36,7 @@ class OddsLedgerPostgresTests(unittest.TestCase):
                     provider="the_odds_api",
                     license_scope="internal_analytics_only",
                     license_version="terms-2026-08-31",
-                    permitted_source_types=frozenset({"odds"}),
+                    permitted_source_types=frozenset({"odds", "result"}),
                 )
             ]
         )
@@ -80,6 +81,43 @@ class OddsLedgerPostgresTests(unittest.TestCase):
             requests_remaining=499,
             requests_used=1,
             request_cost=1,
+        )
+
+    def _results_payload(
+        self,
+        raw_payload: bytes,
+        *,
+        received_at: datetime,
+        last_update: datetime,
+        home_score: int,
+    ) -> PreparedResultsPayload:
+        return PreparedResultsPayload(
+            provider="the_odds_api",
+            source_type="result",
+            raw_payload=raw_payload,
+            captured_at=last_update,
+            received_at=received_at,
+            schema_version="v4",
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+            scores=(
+                CompletedScore(
+                    provider="the_odds_api",
+                    event_id=self.event_id,
+                    sport="basketball_nba",
+                    league="NBA",
+                    commence_time=self.now - timedelta(hours=3),
+                    last_update=last_update,
+                    home_team="Home",
+                    away_team="Away",
+                    home_score=home_score,
+                    away_score=99,
+                ),
+            ),
+            request_scope=(("sport_key", "basketball_nba"), ("days_from", "3")),
+            requests_remaining=498,
+            requests_used=2,
+            request_cost=2,
         )
 
     def test_receipts_provenance_and_snapshot_links_are_written_together(self):
@@ -168,6 +206,121 @@ class OddsLedgerPostgresTests(unittest.TestCase):
                 )
                 (snapshot_count,) = cursor.fetchone()
         self.assertEqual(snapshot_count, 2)
+
+    def test_result_correction_appends_a_new_version_with_provenance(self):
+        first_update = self.now - timedelta(seconds=10)
+        first = self.ledger.persist_results(
+            self._results_payload(
+                b'{"score":101}',
+                received_at=self.now,
+                last_update=first_update,
+                home_score=101,
+            ),
+            now=self.now,
+        )
+        later = datetime.now(UTC)
+        correction = self.ledger.persist_results(
+            self._results_payload(
+                b'{"score":102}',
+                received_at=later,
+                last_update=later,
+                home_score=102,
+            ),
+            now=later,
+        )
+
+        self.assertEqual(first.results_created, 1)
+        self.assertEqual(correction.results_created, 1)
+
+        import psycopg
+
+        with psycopg.connect(_DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT count(DISTINCT result.id),
+                           count(DISTINCT result_link.provenance_id),
+                           array_agg(result.home_score ORDER BY result.settled_at)
+                    FROM sports_event event
+                    JOIN event_result result ON result.event_id = event.id
+                    JOIN event_result_provenance result_link
+                      ON result_link.event_result_id = result.id
+                    WHERE event.provider = %s AND event.provider_event_id = %s
+                    """,
+                    ("the_odds_api", self.event_id),
+                )
+                result_count, provenance_count, home_scores = cursor.fetchone()
+
+        self.assertEqual(result_count, 2)
+        self.assertEqual(provenance_count, 2)
+        self.assertEqual(home_scores, [101, 102])
+
+    def test_persisted_odds_and_result_become_a_model_training_row(self):
+        starts_at = self.now - timedelta(hours=3)
+        captured_at = starts_at - timedelta(hours=1)
+        quotes = []
+        prices = {
+            "book-a": {"Home": -100.0, "Away": -100.0},
+            "book-b": {"Home": 120.0, "Away": -125.0},
+        }
+        for bookmaker, selections in prices.items():
+            for selection, american_odds in selections.items():
+                quotes.append(
+                    RawOddsQuote(
+                        provider="the_odds_api",
+                        provider_quote_id=f"{self.event_id}-{bookmaker}-{selection}",
+                        event_id=self.event_id,
+                        sport="basketball_nba",
+                        market="h2h",
+                        selection=selection,
+                        american_odds=american_odds,
+                        line=None,
+                        captured_at=captured_at,
+                        starts_at=starts_at,
+                        bookmaker=bookmaker,
+                        league="NBA",
+                        home_team="Home",
+                        away_team="Away",
+                    )
+                )
+        odds_payload = PreparedOddsPayload(
+            provider="the_odds_api",
+            source_type="odds",
+            raw_payload=b'{"historical":"odds"}',
+            captured_at=captured_at,
+            received_at=captured_at,
+            schema_version="v4",
+            license_scope="internal_analytics_only",
+            license_version="terms-2026-08-31",
+            quotes=tuple(quotes),
+            request_scope=(("sport_key", "basketball_nba"), ("regions", "us"), ("markets", "h2h")),
+            requests_remaining=499,
+            requests_used=1,
+            request_cost=1,
+        )
+        odds_write = self.ledger.persist(odds_payload, now=captured_at)
+        result_write = self.ledger.persist_results(
+            self._results_payload(
+                b'{"historical":"result"}',
+                received_at=self.now,
+                last_update=self.now - timedelta(seconds=10),
+                home_score=101,
+            ),
+            now=self.now,
+        )
+
+        rows = load_h2h_market_training_rows(
+            _DATABASE_URL,
+            sport="basketball_nba",
+            training_cutoff=self.now + timedelta(seconds=1),
+        )
+        row = next(item for item in rows if item.event_id and item.label_source_snapshot_id)
+
+        self.assertEqual(odds_write.snapshots_created, 4)
+        self.assertEqual(result_write.results_created, 1)
+        self.assertEqual(row.outcome, 1)
+        self.assertAlmostEqual(row.features["market_probability"], 0.475)
+        self.assertEqual(len(row.source_snapshot_ids), 4)
 
     def test_empty_provider_response_retains_receipt_and_provenance_without_snapshots(self):
         import psycopg
