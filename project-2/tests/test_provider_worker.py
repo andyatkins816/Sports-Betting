@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import inspect
 import os
 import sys
@@ -16,6 +17,13 @@ from uuid import UUID, uuid4
 
 from sam_analytics.ingestion import RawOddsQuote
 from sam_analytics.ingestion_runs import IngestionFailureCode, IngestionRunState
+from sam_analytics.modeling import (
+    PREGAME_H2H_FEATURE_SCHEMA,
+    FittedProbabilityModel,
+    ModelCandidate,
+    ProbabilityMetrics,
+    PromotionDecision,
+)
 from sam_analytics.odds_ledger import ResultsLedgerWriteResult
 from sam_analytics.provider_shadow import ProviderShadowFetchFailure
 from sam_analytics.providers.the_odds_api import (
@@ -136,6 +144,10 @@ class ProviderWorkerTests(unittest.TestCase):
             "sam_provider_shadow",
         )
         self.assertEqual(
+            app.conf.task_routes["sam_analytics.train_model_candidate"]["queue"],
+            "sam_provider_shadow",
+        )
+        self.assertEqual(
             {queue.name for queue in app.conf.task_queues},
             {"sam_provider_shadow"},
         )
@@ -184,6 +196,26 @@ class ProviderWorkerTests(unittest.TestCase):
         self.assertIsNone(result.result)
         execute.assert_called_once_with(task_id=task_id)
 
+    def test_model_task_is_zero_argument_no_retry_and_returns_nothing(self) -> None:
+        worker = self._load_worker(self._environment())
+
+        self.assertEqual(
+            tuple(inspect.signature(worker.train_model_candidate.run).parameters),
+            (),
+        )
+        self.assertFalse(worker.train_model_candidate.acks_late)
+        self.assertFalse(worker.train_model_candidate.reject_on_worker_lost)
+        self.assertEqual(worker.train_model_candidate.max_retries, 0)
+        self.assertEqual(worker.train_model_candidate.soft_time_limit, 600)
+        self.assertEqual(worker.train_model_candidate.time_limit, 720)
+
+        with patch.object(worker, "_execute_model_training", return_value=None) as execute:
+            result = worker.train_model_candidate.apply(throw=True)
+
+        self.assertTrue(result.successful())
+        self.assertIsNone(result.result)
+        execute.assert_called_once_with()
+
     def test_execution_revalidates_before_constructing_dependencies(self) -> None:
         worker = self._load_worker(self._environment())
         environment = self._environment()
@@ -198,6 +230,185 @@ class ProviderWorkerTests(unittest.TestCase):
                     with self.assertRaises(worker.WorkerConfigurationError):
                         executor(task_id=str(uuid4()), environ=environment)
                 client_factory.assert_not_called()
+
+        with patch.object(worker, "load_h2h_market_training_rows") as load_rows:
+            with self.assertRaises(worker.WorkerConfigurationError):
+                worker._execute_model_training(environ=environment)
+        load_rows.assert_not_called()
+
+    def test_model_training_waits_for_required_settled_history(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+
+        with (
+            patch.object(
+                worker,
+                "load_h2h_market_training_rows",
+                return_value=tuple(range(749)),
+            ) as load_rows,
+            patch.object(worker, "ProbabilityModelEvaluator") as evaluator,
+            patch.object(worker, "_persist_model_candidate") as persist,
+        ):
+            result = worker._execute_model_training(environ=environment)
+
+        self.assertIsNone(result)
+        load_rows.assert_called_once_with(
+            environment["DATABASE_URL"],
+            sport="baseball_mlb",
+            training_cutoff=ANY,
+        )
+        evaluator.assert_not_called()
+        persist.assert_not_called()
+
+    def test_model_training_refuses_to_register_when_no_candidate_passes(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+        evaluation = _evaluation()
+        evaluator = MagicMock()
+        evaluator.evaluate_many.return_value = (evaluation,)
+
+        with (
+            patch.object(
+                worker,
+                "load_h2h_market_training_rows",
+                return_value=tuple(range(750)),
+            ),
+            patch.object(worker, "ProbabilityModelEvaluator", return_value=evaluator),
+            patch.object(
+                worker,
+                "evaluate_candidate_promotion",
+                return_value=PromotionDecision(False, ("quality gate failed",)),
+            ),
+            patch.object(worker, "_persist_model_candidate") as persist,
+        ):
+            with self.assertRaises(worker.WorkerConfigurationError):
+                worker._execute_model_training(environ=environment)
+
+        persist.assert_not_called()
+
+    def test_model_training_registers_only_a_gated_candidate(self) -> None:
+        environment = self._environment()
+        worker = self._load_worker(environment)
+        evaluation = _evaluation()
+        evaluator = MagicMock()
+        evaluator.evaluate_many.return_value = (evaluation,)
+        fitted = FittedProbabilityModel(
+            candidate=evaluation.candidate,
+            schema=PREGAME_H2H_FEATURE_SCHEMA,
+            estimator={"fitted": True},
+            calibrator=None,
+            trained_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+            released_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+            training_rows=750,
+        )
+
+        with (
+            patch.object(
+                worker,
+                "load_h2h_market_training_rows",
+                return_value=tuple(range(750)),
+            ),
+            patch.object(worker, "ProbabilityModelEvaluator", return_value=evaluator),
+            patch.object(
+                worker,
+                "evaluate_candidate_promotion",
+                return_value=PromotionDecision(True, ()),
+            ),
+            patch.object(worker, "select_best_candidate", return_value=evaluation),
+            patch.object(worker, "fit_approved_model", return_value=fitted) as fit,
+            patch.object(worker, "_persist_model_candidate", return_value=True) as persist,
+        ):
+            result = worker._execute_model_training(environ=environment)
+
+        self.assertIsNone(result)
+        fit.assert_called_once()
+        registered = persist.call_args.kwargs
+        self.assertEqual(registered["sport"], "baseball_mlb")
+        self.assertEqual(len(registered["schema_sha256"]), 64)
+        self.assertEqual(len(registered["artifact_sha256"]), 64)
+        self.assertEqual(registered["artifact_sha256"], worker.hashlib.sha256(registered["artifact"]).hexdigest())
+        self.assertEqual(
+            registered["validation_report"]["governance_status"],
+            "candidate_requires_independent_approval",
+        )
+        self.assertTrue(
+            registered["validation_report"]["candidate_evaluations"][0][
+                "promotion_gates_passed"
+            ]
+        )
+
+    def test_candidate_artifact_omits_release_authority_and_round_trips(self) -> None:
+        worker = self._load_worker(self._environment())
+        model = FittedProbabilityModel(
+            candidate=ModelCandidate("logistic_baseline", "logistic_regression"),
+            schema=PREGAME_H2H_FEATURE_SCHEMA,
+            estimator={"coefficient": 0.25},
+            calibrator=None,
+            trained_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+            released_at=datetime(2026, 9, 7, 12, tzinfo=UTC),
+            training_rows=750,
+        )
+
+        artifact, digest = worker._serialize_model_candidate(model)
+        restored = worker.joblib.load(io.BytesIO(artifact))
+
+        self.assertEqual(digest, worker.hashlib.sha256(artifact).hexdigest())
+        self.assertEqual(restored["candidate"]["name"], "logistic_baseline")
+        self.assertEqual(restored["training_rows"], 750)
+        self.assertNotIn("released_at", restored)
+
+    def test_model_candidate_persistence_is_unapproved_and_idempotent(self) -> None:
+        worker = self._load_worker(self._environment())
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.return_value = (uuid4(),)
+        artifact = b"immutable-model"
+        digest = worker.hashlib.sha256(artifact).hexdigest()
+
+        with patch.object(worker.psycopg, "connect", return_value=connection):
+            inserted = worker._persist_model_candidate(
+                database_url=self._environment()["DATABASE_URL"],
+                version="sam-test-version",
+                sport="baseball_mlb",
+                schema_sha256="a" * 64,
+                artifact=artifact,
+                artifact_sha256=digest,
+                training_cutoff=datetime(2026, 9, 6, 12, tzinfo=UTC),
+                validation_report={"status": "passed"},
+            )
+
+        self.assertTrue(inserted)
+        self.assertEqual(cursor.execute.call_count, 2)
+        registry_sql, registry_params = cursor.execute.call_args_list[0].args
+        self.assertIn("INSERT INTO model_registry", registry_sql)
+        self.assertIn("'candidate'", registry_sql)
+        self.assertIn("ON CONFLICT (version) DO NOTHING", registry_sql)
+        self.assertEqual(registry_params[0], "sam-test-version")
+        self.assertEqual(registry_params[5], digest)
+        self.assertEqual(registry_params[6], "joblib-sklearn-v1")
+        self.assertEqual(registry_params[7], artifact)
+        signal_sql = cursor.execute.call_args_list[1].args[0]
+        self.assertIn("INSERT INTO operational_signal", signal_sql)
+        connection.commit.assert_called_once_with()
+        connection.close.assert_called_once_with()
+
+        replay_connection = MagicMock()
+        replay_cursor = replay_connection.cursor.return_value.__enter__.return_value
+        replay_cursor.fetchone.return_value = None
+        with patch.object(worker.psycopg, "connect", return_value=replay_connection):
+            replayed = worker._persist_model_candidate(
+                database_url=self._environment()["DATABASE_URL"],
+                version="sam-test-version",
+                sport="baseball_mlb",
+                schema_sha256="a" * 64,
+                artifact=artifact,
+                artifact_sha256=digest,
+                training_cutoff=datetime(2026, 9, 6, 12, tzinfo=UTC),
+                validation_report={"status": "passed"},
+            )
+
+        self.assertFalse(replayed)
+        self.assertEqual(replay_cursor.execute.call_count, 1)
 
     def test_execution_injects_only_reviewed_private_dependencies(self) -> None:
         environment = self._environment()
@@ -627,6 +838,28 @@ class ProviderWorkerTests(unittest.TestCase):
                     raised.exception.failure_code,
                     IngestionFailureCode.PROVIDER_RESPONSE_INVALID,
                 )
+
+
+def _evaluation() -> MagicMock:
+    metrics = ProbabilityMetrics(
+        sample_size=500,
+        brier=0.20,
+        logloss=0.60,
+        expected_calibration_error=0.04,
+    )
+    score = MagicMock(
+        evaluated_rows=500,
+        total_rows=750,
+        fold_count=5,
+        coverage=500 / 750,
+        metrics=metrics,
+    )
+    return MagicMock(
+        candidate=ModelCandidate("logistic_baseline", "logistic_regression"),
+        data_fingerprint="d" * 64,
+        score=score,
+        raw_metrics=metrics,
+    )
 
 
 def _quote(

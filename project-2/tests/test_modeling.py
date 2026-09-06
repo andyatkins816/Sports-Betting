@@ -34,6 +34,7 @@ from sam_analytics.modeling import (
     cross_fit_isotonic_calibration,
     default_model_candidates,
     evaluate_promotion,
+    feature_schema_fingerprint,
     validate_prediction_input,
 )
 
@@ -114,6 +115,15 @@ class ModelingContractTests(unittest.TestCase):
                     }
                 )
         return rows
+
+    def test_feature_schema_fingerprint_is_stable_and_contract_bound(self):
+        digest = feature_schema_fingerprint(PREGAME_H2H_FEATURE_SCHEMA)
+
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, feature_schema_fingerprint(PREGAME_H2H_FEATURE_SCHEMA))
+        self.assertNotEqual(digest, feature_schema_fingerprint(self.schema))
+        with self.assertRaises(ModelDataError):
+            feature_schema_fingerprint(None)
 
     def test_persisted_market_rows_are_point_in_time_coherent_and_provenance_bound(self):
         starts_at = self.start + timedelta(hours=2)

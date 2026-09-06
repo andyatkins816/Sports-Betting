@@ -181,6 +181,32 @@ def _is_aware(value: datetime) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
+def feature_schema_fingerprint(schema: FeatureSchema) -> str:
+    """Return the canonical SHA-256 identity of an ordered feature schema."""
+
+    if not isinstance(schema, FeatureSchema):
+        raise ModelDataError("feature schema fingerprinting requires a FeatureSchema")
+    payload = {
+        "schema_id": schema.schema_id,
+        "features": [
+            {
+                "name": feature.name,
+                "minimum": feature.minimum,
+                "maximum": feature.maximum,
+            }
+            for feature in schema.features
+        ],
+        "reject_unknown_features": schema.reject_unknown_features,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_source_snapshots(source_snapshot_ids: Sequence[str]) -> None:
     if isinstance(source_snapshot_ids, str):
         raise ModelDataError("source snapshot ids must be a sequence, not one string")
@@ -502,30 +528,71 @@ def load_h2h_market_training_rows(
                           )
                         ORDER BY result.event_id, result.settled_at DESC,
                                  result.received_at DESC, result.id DESC
+                    ),
+                    eligible_quotes AS (
+                        SELECT event.id AS event_id, event.sport, event.starts_at,
+                               event.home_team, event.away_team,
+                               quote.id AS odds_snapshot_id, quote.bookmaker,
+                               quote.primary_provenance_id, quote.market, quote.selection,
+                               quote.decimal_odds, quote.captured_at,
+                               quote.received_at AS quote_received_at,
+                               result.id AS result_id, result.settled_at,
+                               result.received_at AS result_received_at,
+                               result.home_score, result.away_score
+                        FROM sports_event AS event
+                        JOIN latest_results AS result ON result.event_id = event.id
+                        JOIN odds_snapshot AS quote ON quote.event_id = event.id
+                        WHERE event.sport = %(sport)s
+                          AND event.starts_at < %(training_cutoff)s
+                          AND quote.market = 'h2h'
+                          AND quote.line IS NULL
+                          AND quote.bookmaker IS NOT NULL
+                          AND quote.primary_provenance_id IS NOT NULL
+                          AND quote.selection IN (event.home_team, event.away_team)
+                          AND quote.captured_at <= event.starts_at - %(decision_lead)s
+                          AND quote.received_at <= event.starts_at - %(decision_lead)s
+                    ),
+                    latest_batch_selections AS (
+                        SELECT DISTINCT ON (
+                                   event_id, bookmaker, primary_provenance_id, selection
+                               )
+                               *
+                        FROM eligible_quotes
+                        ORDER BY event_id, bookmaker, primary_provenance_id, selection,
+                                 quote_received_at DESC, captured_at DESC,
+                                 odds_snapshot_id DESC
+                    ),
+                    complete_batches AS (
+                        SELECT event_id, bookmaker, primary_provenance_id,
+                               max(quote_received_at) AS pair_received_at,
+                               max(captured_at) AS pair_captured_at
+                        FROM latest_batch_selections
+                        GROUP BY event_id, bookmaker, primary_provenance_id
+                        HAVING count(*) = 2
+                    ),
+                    selected_batches AS (
+                        SELECT DISTINCT ON (event_id, bookmaker)
+                               event_id, bookmaker, primary_provenance_id
+                        FROM complete_batches
+                        ORDER BY event_id, bookmaker, pair_received_at DESC,
+                                 pair_captured_at DESC, primary_provenance_id DESC
                     )
-                    SELECT event.id AS event_id, event.sport, event.starts_at,
-                           event.home_team, event.away_team,
-                           quote.id AS odds_snapshot_id, quote.bookmaker,
+                    SELECT quote.event_id, quote.sport, quote.starts_at,
+                           quote.home_team, quote.away_team,
+                           quote.odds_snapshot_id, quote.bookmaker,
                            quote.primary_provenance_id, quote.market, quote.selection,
                            quote.decimal_odds, quote.captured_at,
-                           quote.received_at AS quote_received_at,
-                           result.id AS result_id, result.settled_at,
-                           result.received_at AS result_received_at,
-                           result.home_score, result.away_score
-                    FROM sports_event AS event
-                    JOIN latest_results AS result ON result.event_id = event.id
-                    JOIN odds_snapshot AS quote ON quote.event_id = event.id
-                    WHERE event.sport = %(sport)s
-                      AND event.starts_at < %(training_cutoff)s
-                      AND quote.market = 'h2h'
-                      AND quote.line IS NULL
-                      AND quote.bookmaker IS NOT NULL
-                      AND quote.primary_provenance_id IS NOT NULL
-                      AND quote.selection IN (event.home_team, event.away_team)
-                      AND quote.captured_at <= event.starts_at - %(decision_lead)s
-                      AND quote.received_at <= event.starts_at - %(decision_lead)s
-                    ORDER BY event.starts_at, event.id, quote.bookmaker,
-                             quote.received_at, quote.captured_at, quote.id
+                           quote.quote_received_at, quote.result_id,
+                           quote.settled_at, quote.result_received_at,
+                           quote.home_score, quote.away_score
+                    FROM latest_batch_selections AS quote
+                    JOIN selected_batches AS selected
+                      ON selected.event_id = quote.event_id
+                     AND selected.bookmaker = quote.bookmaker
+                     AND selected.primary_provenance_id = quote.primary_provenance_id
+                    ORDER BY quote.starts_at, quote.event_id, quote.bookmaker,
+                             quote.quote_received_at, quote.captured_at,
+                             quote.odds_snapshot_id
                     """,
                     {
                         "sport": sport,
