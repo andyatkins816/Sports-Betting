@@ -37,7 +37,13 @@ class OddsLedgerPostgresTests(unittest.TestCase):
                     license_scope="internal_analytics_only",
                     license_version="terms-2026-08-31",
                     permitted_source_types=frozenset({"odds", "result"}),
-                )
+                ),
+                ApprovedProviderContract(
+                    provider="retrosheet",
+                    license_scope="commercial_use_with_attribution",
+                    license_version="notice-2026-09-06",
+                    permitted_source_types=frozenset({"result"}),
+                ),
             ]
         )
         self.store = InMemoryRawPayloadStore(namespace="sam-ci-private-evidence")
@@ -288,7 +294,7 @@ class OddsLedgerPostgresTests(unittest.TestCase):
             source_type="odds",
             raw_payload=b'{"historical":"odds"}',
             captured_at=captured_at,
-            received_at=captured_at,
+            received_at=self.now,
             schema_version="v4",
             license_scope="internal_analytics_only",
             license_version="terms-2026-08-31",
@@ -297,14 +303,39 @@ class OddsLedgerPostgresTests(unittest.TestCase):
             requests_remaining=499,
             requests_used=1,
             request_cost=1,
+            source_available_at=captured_at,
         )
-        odds_write = self.ledger.persist(odds_payload, now=captured_at)
+        odds_write = self.ledger.persist(odds_payload, now=self.now)
+        result_available_at = self.now - timedelta(seconds=10)
         result_write = self.ledger.persist_results(
-            self._results_payload(
-                b'{"historical":"result"}',
+            PreparedResultsPayload(
+                provider="retrosheet",
+                source_type="result",
+                raw_payload=b'{"historical":"result"}',
+                captured_at=result_available_at,
                 received_at=self.now,
-                last_update=self.now - timedelta(seconds=10),
-                home_score=101,
+                schema_version="gl2025-v1",
+                license_scope="commercial_use_with_attribution",
+                license_version="notice-2026-09-06",
+                scores=(
+                    CompletedScore(
+                        provider="retrosheet",
+                        event_id=f"retrosheet-{self.event_id}",
+                        sport="basketball_nba",
+                        league="NBA",
+                        commence_time=starts_at,
+                        last_update=result_available_at,
+                        home_team="Home",
+                        away_team="Away",
+                        home_score=101,
+                        away_score=99,
+                        source_available_at=result_available_at,
+                        matched_event_provider="the_odds_api",
+                        matched_provider_event_id=self.event_id,
+                    ),
+                ),
+                request_scope=(("season", "2025"),),
+                source_available_at=result_available_at,
             ),
             now=self.now,
         )
@@ -441,11 +472,12 @@ class OddsLedgerPostgresTests(unittest.TestCase):
                         INSERT INTO odds_snapshot (
                             event_id, provider, provider_quote_id, bookmaker, market, selection,
                             line, american_odds, decimal_odds, captured_at, received_at,
-                            source_payload_sha256, idempotency_key, primary_provenance_id
+                            source_available_at, source_payload_sha256, idempotency_key,
+                            primary_provenance_id
                         ) SELECT
                             event_id, provider, provider_quote_id, bookmaker, market, selection,
                             line, american_odds, decimal_odds, captured_at, received_at + interval '1 second',
-                            source_payload_sha256, %s, primary_provenance_id
+                            source_available_at, source_payload_sha256, %s, primary_provenance_id
                         FROM odds_snapshot WHERE id = %s
                         """,
                         (hashlib.sha256(f"bad-time:{self.event_id}".encode()).hexdigest(), snapshot_id),

@@ -57,6 +57,7 @@ class OddsApiFetch:
     raw_payload: bytes = b""
     received_at: datetime | None = None
     request_scope: OddsApiRequestScope | None = None
+    source_available_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class OddsApiRequestScope:
     regions: tuple[str, ...]
     markets: tuple[str, ...]
     bookmakers: tuple[str, ...] = ()
+    snapshot_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,9 @@ class CompletedScore:
     away_team: str
     home_score: int
     away_score: int
+    source_available_at: datetime | None = None
+    matched_event_provider: str | None = None
+    matched_provider_event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +201,78 @@ class TheOddsApiClient:
             raw_payload=response.raw_payload,
             received_at=response.received_at,
             request_scope=request_scope,
+        )
+
+    def fetch_historical_odds(
+        self,
+        sport_key: str,
+        *,
+        snapshot_at: datetime,
+        regions: str = "us",
+        markets: Iterable[str] = ("h2h", "spreads", "totals"),
+        bookmakers: str | None = None,
+    ) -> OddsApiFetch:
+        """Fetch one historical pregame snapshot without retaining credentials."""
+        requested_markets = tuple(markets)
+        if not sport_key or not regions:
+            raise ValueError("sport_key and regions are required")
+        if not _SPORT_KEY.fullmatch(sport_key):
+            raise ValueError("sport_key must contain only lowercase letters, digits, and underscores")
+        if not requested_markets or not all(isinstance(market, str) for market in requested_markets):
+            raise ValueError("at least one market is required")
+        if not set(requested_markets) <= self.supported_featured_markets:
+            raise ValueError("only featured markets h2h, spreads, and totals are supported in this endpoint")
+        if not _is_aware_datetime(snapshot_at) or snapshot_at.utcoffset() != UTC.utcoffset(snapshot_at):
+            raise ValueError("snapshot_at must be a timezone-aware UTC datetime")
+        requested_regions = _parse_scope_values(regions, field="regions")
+        requested_bookmakers = (
+            _parse_scope_values(bookmakers, field="bookmakers") if bookmakers is not None else ()
+        )
+        snapshot_at = snapshot_at.astimezone(UTC)
+        request_scope = OddsApiRequestScope(
+            sport_key=sport_key,
+            regions=requested_regions,
+            markets=requested_markets,
+            bookmakers=requested_bookmakers,
+            snapshot_at=snapshot_at,
+        )
+        params = {
+            "apiKey": self._api_key,
+            "regions": ",".join(requested_regions),
+            "markets": ",".join(requested_markets),
+            "date": snapshot_at.isoformat().replace("+00:00", "Z"),
+            "dateFormat": "iso",
+            "oddsFormat": "american",
+        }
+        if requested_bookmakers:
+            params["bookmakers"] = ",".join(requested_bookmakers)
+        response = self._request(f"/historical/sports/{sport_key}/odds", params)
+        if not isinstance(response.payload, Mapping):
+            raise TheOddsApiError("provider returned an unexpected historical odds payload")
+        returned_at = _parse_provider_time(response.payload.get("timestamp"))
+        previous_at = _parse_provider_time(response.payload.get("previous_timestamp"))
+        next_at = _parse_provider_time(response.payload.get("next_timestamp"))
+        if returned_at > snapshot_at:
+            raise TheOddsApiError("provider returned a historical snapshot after the requested time")
+        if previous_at >= returned_at or next_at <= snapshot_at:
+            raise TheOddsApiError("provider returned invalid historical snapshot navigation")
+        data = _required_list(response.payload, "data")
+        quotes, skipped = self.parse_response(
+            data,
+            sport_key=sport_key,
+            requested_markets=requested_markets,
+            now=returned_at,
+        )
+        return OddsApiFetch(
+            quotes=quotes,
+            requests_remaining=_header_int(response.headers, "x-requests-remaining"),
+            requests_used=_header_int(response.headers, "x-requests-used"),
+            request_cost=_header_int(response.headers, "x-requests-last"),
+            skipped_live_events=skipped,
+            raw_payload=response.raw_payload,
+            received_at=response.received_at,
+            request_scope=request_scope,
+            source_available_at=returned_at,
         )
 
     def fetch_scores(self, sport_key: str, *, days_from: int = 3) -> ScoresApiFetch:

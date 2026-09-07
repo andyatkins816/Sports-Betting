@@ -676,7 +676,7 @@ def load_h2h_market_prediction_inputs(
                                quote.id AS odds_snapshot_id, quote.bookmaker,
                                quote.primary_provenance_id, quote.market, quote.selection,
                                quote.decimal_odds, quote.captured_at,
-                               quote.received_at AS quote_received_at
+                               quote.source_available_at AS quote_received_at
                         FROM candidate_events AS event
                         JOIN odds_snapshot AS quote ON quote.event_id = event.id
                         JOIN raw_data_provenance AS provenance
@@ -688,6 +688,7 @@ def load_h2h_market_prediction_inputs(
                           AND quote.bookmaker IS NOT NULL
                           AND quote.selection IN (event.home_team, event.away_team)
                           AND quote.captured_at <= event.starts_at - %(decision_lead)s
+                          AND quote.source_available_at <= event.starts_at - %(decision_lead)s
                           AND quote.received_at <= event.starts_at - %(decision_lead)s
                           AND provenance.source_type = 'odds'
                           AND provenance.payload_sha256 = quote.source_payload_sha256
@@ -794,12 +795,13 @@ def load_h2h_market_training_rows(
                     WITH latest_results AS (
                         SELECT DISTINCT ON (result.event_id)
                                result.id, result.event_id, result.settled_at,
-                               result.received_at, result.home_score, result.away_score
+                               result.source_available_at AS received_at,
+                               result.home_score, result.away_score
                         FROM event_result AS result
                         JOIN sports_event AS result_event ON result_event.id = result.event_id
-                        WHERE result.provider = result_event.provider
-                          AND result_event.sport = %(sport)s
+                        WHERE result_event.sport = %(sport)s
                           AND result.received_at <= %(training_cutoff)s
+                          AND result.source_available_at <= %(training_cutoff)s
                           AND result.settled_at <= %(training_cutoff)s
                           AND result.settled_at >= result_event.starts_at
                           AND EXISTS (
@@ -820,6 +822,7 @@ def load_h2h_market_training_rows(
                                 AND result_receipt.received_at = result.received_at
                           )
                         ORDER BY result.event_id, result.settled_at DESC,
+                                 result.source_available_at DESC,
                                  result.received_at DESC, result.id DESC
                     ),
                     eligible_quotes AS (
@@ -828,7 +831,7 @@ def load_h2h_market_training_rows(
                                quote.id AS odds_snapshot_id, quote.bookmaker,
                                quote.primary_provenance_id, quote.market, quote.selection,
                                quote.decimal_odds, quote.captured_at,
-                               quote.received_at AS quote_received_at,
+                               quote.source_available_at AS quote_received_at,
                                result.id AS result_id, result.settled_at,
                                result.received_at AS result_received_at,
                                result.home_score, result.away_score
@@ -843,7 +846,8 @@ def load_h2h_market_training_rows(
                           AND quote.primary_provenance_id IS NOT NULL
                           AND quote.selection IN (event.home_team, event.away_team)
                           AND quote.captured_at <= event.starts_at - %(decision_lead)s
-                          AND quote.received_at <= event.starts_at - %(decision_lead)s
+                          AND quote.source_available_at <= event.starts_at - %(decision_lead)s
+                          AND quote.received_at <= %(training_cutoff)s
                     ),
                     latest_batch_selections AS (
                         SELECT DISTINCT ON (

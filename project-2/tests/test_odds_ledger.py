@@ -21,6 +21,7 @@ from sam_analytics.odds_ledger import (
     OddsLedgerValidationError,
     PreparedOddsPayload,
     PreparedResultsPayload,
+    _provider_result_id,
     prepare_the_odds_api_payload,
     prepare_the_odds_api_results_payload,
 )
@@ -200,7 +201,13 @@ class OddsLedgerTests(unittest.TestCase):
                     license_scope="internal_analytics_only",
                     license_version="terms-2026-08-31",
                     permitted_source_types=frozenset({"odds", "result"}),
-                )
+                ),
+                ApprovedProviderContract(
+                    provider="retrosheet",
+                    license_scope="commercial_use_with_attribution",
+                    license_version="notice-2026-09-06",
+                    permitted_source_types=frozenset({"result"}),
+                ),
             ]
         )
         self.store = InMemoryRawPayloadStore()
@@ -233,7 +240,14 @@ class OddsLedgerTests(unittest.TestCase):
             away_team="Away",
         )
 
-    def _payload(self, *, quote=None, raw_payload=b'{"response":1}', received_at=None):
+    def _payload(
+        self,
+        *,
+        quote=None,
+        raw_payload=b'{"response":1}',
+        received_at=None,
+        source_available_at=None,
+    ):
         quote = quote or self._quote()
         received_at = received_at or self.now
         return PreparedOddsPayload(
@@ -254,6 +268,7 @@ class OddsLedgerTests(unittest.TestCase):
             requests_remaining=499,
             requests_used=1,
             request_cost=1,
+            source_available_at=source_available_at,
         )
 
     def _score(
@@ -355,6 +370,40 @@ class OddsLedgerTests(unittest.TestCase):
         self.assertEqual(corrected.snapshots_created, 1)
         self.assertEqual(len(self.connection.state["snapshots"]), 2)
 
+    def test_historical_odds_preserve_real_receipt_and_use_snapshot_availability(self):
+        snapshot_at = self.now - timedelta(days=30)
+        starts_at = snapshot_at + timedelta(hours=2)
+        quote = RawOddsQuote(
+            **{
+                **self._quote().__dict__,
+                "captured_at": snapshot_at - timedelta(seconds=10),
+                "starts_at": starts_at,
+            }
+        )
+
+        result = self._ledger().persist(
+            self._payload(quote=quote, source_available_at=snapshot_at),
+            now=self.now,
+        )
+
+        self.assertEqual(result.snapshots_created, 1)
+        stored = next(iter(self.connection.state["snapshots"].values()))[1]
+        self.assertEqual(stored[10], self.now)
+        self.assertEqual(stored[11], snapshot_at)
+        receipt = next(iter(self.connection.state["receipts"].values()))[1]
+        self.assertEqual(receipt[7], snapshot_at)
+
+        different_availability = PreparedOddsPayload(
+            **{
+                **self._payload(quote=quote, source_available_at=snapshot_at).__dict__,
+                "source_available_at": snapshot_at - timedelta(minutes=1),
+            }
+        )
+        self.assertNotEqual(
+            self._payload(quote=quote, source_available_at=snapshot_at).receipt_sha256,
+            different_availability.receipt_sha256,
+        )
+
     def test_completed_result_replay_is_idempotent_and_linked_to_private_evidence(self):
         payload = self._results_payload()
 
@@ -371,6 +420,119 @@ class OddsLedgerTests(unittest.TestCase):
         self.assertEqual(len(self.connection.state["results"]), 1)
         self.assertEqual(len(self.connection.state["result_provenance"]), 1)
         self.assertEqual(self.store.stored_count, 1)
+
+    def test_live_result_keeps_its_existing_immutable_identity(self):
+        score = self._score()
+
+        self.assertEqual(
+            _provider_result_id(score),
+            "f371d6013e7f498858137e0df08fe39f596a7218a73f5b08327925e3affffb8e",
+        )
+
+    def test_retrosheet_result_can_only_attach_to_an_existing_matched_event(self):
+        starts_at = self.now - timedelta(days=30, hours=3)
+        self.connection.state["events"][("the_odds_api", "odds-event-1")] = (
+            "event-existing",
+            "baseball_mlb",
+            "MLB",
+            starts_at,
+            "Arizona Diamondbacks",
+            "Chicago Cubs",
+        )
+        score = CompletedScore(
+            provider="retrosheet",
+            event_id="ARI202504030",
+            sport="baseball_mlb",
+            league="MLB",
+            commence_time=starts_at,
+            last_update=starts_at + timedelta(hours=12),
+            home_team="Arizona Diamondbacks",
+            away_team="Chicago Cubs",
+            home_score=6,
+            away_score=10,
+            source_available_at=starts_at + timedelta(hours=12),
+            matched_event_provider="the_odds_api",
+            matched_provider_event_id="odds-event-1",
+        )
+        payload = PreparedResultsPayload(
+            provider="retrosheet",
+            source_type="result",
+            raw_payload=b"retrosheet-archive",
+            captured_at=score.last_update,
+            received_at=self.now,
+            schema_version="gl2025-v1",
+            license_scope="commercial_use_with_attribution",
+            license_version="notice-2026-09-06",
+            scores=(score,),
+            request_scope=(("season", "2025"),),
+            source_available_at=score.source_available_at,
+        )
+
+        result = self._ledger().persist_results(payload, now=self.now)
+
+        self.assertEqual(result.events_created, 0)
+        self.assertEqual(result.results_created, 1)
+        stored = next(iter(self.connection.state["results"].values()))[1]
+        self.assertEqual(stored[0], "event-existing")
+        self.assertEqual(stored[1], "retrosheet")
+        self.assertEqual(stored[-1], score.source_available_at)
+
+        missing = CompletedScore(
+            **{**score.__dict__, "matched_provider_event_id": "missing-event"}
+        )
+        with self.assertRaisesRegex(OddsLedgerValidationError, "unavailable matched event"):
+            self._ledger().persist_results(
+                PreparedResultsPayload(
+                    **{**payload.__dict__, "scores": (missing,), "raw_payload": b"other-archive"}
+                ),
+                now=self.now,
+            )
+
+        inconsistent_availability = CompletedScore(
+            **{
+                **score.__dict__,
+                "source_available_at": score.last_update + timedelta(seconds=1),
+            }
+        )
+        with self.assertRaisesRegex(
+            OddsLedgerValidationError,
+            "availability must match its immutable update time",
+        ):
+            self._ledger().persist_results(
+                PreparedResultsPayload(
+                    **{
+                        **payload.__dict__,
+                        "scores": (inconsistent_availability,),
+                        "raw_payload": b"third-archive",
+                        "source_available_at": inconsistent_availability.source_available_at,
+                    }
+                ),
+                now=self.now,
+            )
+
+        wrong_doubleheader = CompletedScore(
+            **{
+                **score.__dict__,
+                "event_id": "ARI202504032",
+                "commence_time": starts_at + timedelta(hours=4),
+                "last_update": starts_at + timedelta(hours=16),
+                "source_available_at": starts_at + timedelta(hours=16),
+            }
+        )
+        wrong_result = self._ledger().persist_results(
+            PreparedResultsPayload(
+                **{
+                    **payload.__dict__,
+                    "scores": (wrong_doubleheader,),
+                    "raw_payload": b"wrong-doubleheader",
+                    "captured_at": wrong_doubleheader.last_update,
+                    "source_available_at": wrong_doubleheader.source_available_at,
+                }
+            ),
+            now=self.now,
+        )
+        self.assertEqual(wrong_result.status, "blocked_event_identity")
+        self.assertEqual(wrong_result.results_created, 0)
 
     def test_provider_result_correction_appends_a_new_immutable_version(self):
         self._ledger().persist_results(self._results_payload(), now=self.now)
@@ -391,6 +553,34 @@ class OddsLedgerTests(unittest.TestCase):
         self.assertEqual(corrected.events_created, 0)
         self.assertEqual(corrected.results_created, 1)
         self.assertEqual(corrected.results_replayed, 0)
+        self.assertEqual(len(self.connection.state["results"]), 2)
+
+    def test_result_source_availability_is_part_of_immutable_identity(self):
+        score = CompletedScore(
+            **{
+                **self._score().__dict__,
+                "source_available_at": self.now - timedelta(seconds=5),
+            }
+        )
+        first = self._results_payload(score=score)
+        later_availability = CompletedScore(
+            **{
+                **score.__dict__,
+                "source_available_at": self.now,
+            }
+        )
+        second = PreparedResultsPayload(
+            **{
+                **first.__dict__,
+                "scores": (later_availability,),
+                "raw_payload": b'{"scores":1,"availability":"revised"}',
+            }
+        )
+
+        self._ledger().persist_results(first, now=self.now)
+        revised = self._ledger().persist_results(second, now=self.now)
+
+        self.assertEqual(revised.results_created, 1)
         self.assertEqual(len(self.connection.state["results"]), 2)
 
     def test_result_tolerates_existing_event_start_and_league_drift(self):
@@ -526,6 +716,57 @@ class OddsLedgerTests(unittest.TestCase):
         self.assertIn(("sport_key", "basketball_nba"), prepared.request_scope)
         self.assertNotIn("apiKey", repr(prepared.request_scope))
         self.assertEqual(prepared.requests_remaining, 499)
+
+    def test_historical_prepare_requires_availability_no_later_than_request(self):
+        snapshot_at = self.now - timedelta(days=1)
+        quote = RawOddsQuote(
+            **{
+                **self._quote().__dict__,
+                "captured_at": snapshot_at - timedelta(minutes=1),
+                "starts_at": snapshot_at + timedelta(hours=2),
+            }
+        )
+        base = OddsApiFetch(
+            quotes=[quote],
+            requests_remaining=80,
+            requests_used=20,
+            request_cost=10,
+            skipped_live_events=0,
+            raw_payload=b'{"historical":true}',
+            received_at=self.now,
+            request_scope=OddsApiRequestScope(
+                sport_key="basketball_nba",
+                regions=("us",),
+                markets=("h2h",),
+                snapshot_at=snapshot_at,
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            OddsLedgerValidationError,
+            "does not contain source availability",
+        ):
+            prepare_the_odds_api_payload(
+                base,
+                license_scope="internal_analytics_only",
+                license_version="terms-2026-08-31",
+            )
+
+        future_availability = OddsApiFetch(
+            **{
+                **base.__dict__,
+                "source_available_at": snapshot_at + timedelta(seconds=1),
+            }
+        )
+        with self.assertRaisesRegex(
+            OddsLedgerValidationError,
+            "after the requested snapshot",
+        ):
+            prepare_the_odds_api_payload(
+                future_availability,
+                license_scope="internal_analytics_only",
+                license_version="terms-2026-08-31",
+            )
 
     def test_prepares_a_private_results_payload_from_a_scores_fetch(self):
         score = self._score()

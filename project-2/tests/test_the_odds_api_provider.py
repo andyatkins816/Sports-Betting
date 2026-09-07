@@ -3,6 +3,7 @@ import json
 import unittest
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -296,6 +297,154 @@ class TheOddsApiProviderTests(unittest.TestCase):
         self.assertEqual(fetched.request_scope.markets, ("h2h", "spreads", "totals"))
         self.assertEqual(fetched.request_scope.bookmakers, ("example_book",))
         self.assertNotIn("never-expose-this-key", repr(fetched))
+
+    def test_historical_fetch_parses_wrapper_and_preserves_safe_receipt(self):
+        requested_at = self.now
+        returned_at = requested_at - timedelta(minutes=5)
+        historical_event = copy.deepcopy(self.payload[0])
+        historical_event["commence_time"] = (requested_at - timedelta(minutes=2)).isoformat()
+        wrapper = {
+            "timestamp": returned_at.isoformat(),
+            "previous_timestamp": (returned_at - timedelta(minutes=5)).isoformat(),
+            "next_timestamp": (requested_at + timedelta(minutes=5)).isoformat(),
+            "data": [historical_event],
+        }
+        raw_payload = b" " + json.dumps(wrapper, separators=(",", ":")).encode() + b"\n"
+
+        class FakeResponse:
+            status = 200
+            headers = {
+                "x-requests-remaining": "80",
+                "x-requests-used": "20",
+                "x-requests-last": "10",
+            }
+
+            def __init__(self):
+                self._was_read = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                if self._was_read:
+                    return b""
+                self._was_read = True
+                return raw_payload
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                self.request = request
+                self.timeout = timeout
+                return FakeResponse()
+
+        receipt_time = requested_at + timedelta(seconds=1)
+        opener = FakeOpener()
+        secret = "never-expose-this-key"
+        with (
+            patch("sam_analytics.providers.the_odds_api.build_opener", return_value=opener),
+            patch("sam_analytics.providers.the_odds_api._utc_now", return_value=receipt_time),
+        ):
+            fetched = TheOddsApiClient(secret).fetch_historical_odds(
+                "basketball_nba",
+                snapshot_at=requested_at,
+                regions="us,eu",
+                markets=("h2h",),
+                bookmakers="example_book",
+            )
+
+        request_url = urlsplit(opener.request.full_url)
+        query = parse_qs(request_url.query)
+        self.assertEqual(request_url.path, "/v4/historical/sports/basketball_nba/odds")
+        self.assertEqual(query["date"], ["2026-01-01T15:00:00Z"])
+        self.assertEqual(query["regions"], ["us,eu"])
+        self.assertEqual(query["markets"], ["h2h"])
+        self.assertEqual(query["bookmakers"], ["example_book"])
+        self.assertEqual(fetched.raw_payload, raw_payload)
+        self.assertEqual(fetched.received_at, receipt_time)
+        self.assertEqual(fetched.requests_remaining, 80)
+        self.assertEqual(fetched.requests_used, 20)
+        self.assertEqual(fetched.request_cost, 10)
+        self.assertEqual(fetched.source_available_at, returned_at)
+        self.assertEqual(fetched.skipped_live_events, 0)
+        self.assertEqual(len(fetched.quotes), 2)
+        self.assertEqual(fetched.request_scope.snapshot_at, requested_at)
+        self.assertEqual(fetched.request_scope.regions, ("us", "eu"))
+        self.assertEqual(fetched.request_scope.markets, ("h2h",))
+        self.assertEqual(fetched.request_scope.bookmakers, ("example_book",))
+        self.assertNotIn(secret, repr(fetched))
+
+    def test_historical_fetch_rejects_malformed_wrapper_and_non_utc_request(self):
+        client = TheOddsApiClient("test-key")
+        for invalid_snapshot in (
+            datetime(2026, 1, 1, 15),
+            datetime.fromisoformat("2026-01-01T16:00:00+01:00"),
+        ):
+            with self.subTest(snapshot=invalid_snapshot), self.assertRaisesRegex(ValueError, "UTC"):
+                client.fetch_historical_odds("basketball_nba", snapshot_at=invalid_snapshot)
+
+        valid_wrapper = {
+            "timestamp": (self.now - timedelta(minutes=5)).isoformat(),
+            "previous_timestamp": (self.now - timedelta(minutes=10)).isoformat(),
+            "next_timestamp": self.now.isoformat(),
+            "data": [],
+        }
+        malformed_wrappers = (
+            [],
+            {**valid_wrapper, "data": {}},
+            {**valid_wrapper, "timestamp": (self.now + timedelta(minutes=1)).isoformat()},
+            {**valid_wrapper, "previous_timestamp": valid_wrapper["timestamp"]},
+            {**valid_wrapper, "next_timestamp": valid_wrapper["timestamp"]},
+            {
+                **valid_wrapper,
+                "timestamp": (self.now - timedelta(minutes=10)).isoformat(),
+                "previous_timestamp": (self.now - timedelta(minutes=15)).isoformat(),
+                "next_timestamp": (self.now - timedelta(minutes=5)).isoformat(),
+            },
+        )
+        for payload in malformed_wrappers:
+            with self.subTest(payload=payload), patch.object(
+                client,
+                "_request",
+                return_value=SimpleNamespace(
+                    payload=payload,
+                    raw_payload=b"{}",
+                    headers={},
+                    received_at=self.now,
+                ),
+            ), self.assertRaises(TheOddsApiError):
+                client.fetch_historical_odds("basketball_nba", snapshot_at=self.now)
+
+    def test_historical_fetch_rejects_non_200_without_exposing_key(self):
+        class FakeResponse:
+            status = 503
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                raise AssertionError("a non-200 response body must not be read")
+
+        class FakeOpener:
+            def open(self, request, timeout):
+                return FakeResponse()
+
+        secret = "never-expose-this-key"
+        with patch(
+            "sam_analytics.providers.the_odds_api.build_opener",
+            return_value=FakeOpener(),
+        ):
+            with self.assertRaisesRegex(TheOddsApiError, "HTTP 503") as raised:
+                TheOddsApiClient(secret).fetch_historical_odds(
+                    "basketball_nba", snapshot_at=self.now, markets=("h2h",)
+                )
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_client_rejects_declared_response_larger_than_limit_without_reading(self):
         class FakeResponse:

@@ -324,11 +324,12 @@ class IngestionAdmissionRepositoryPostgresTests(unittest.TestCase):
             INSERT INTO provider_payload_receipt (
                 id, provider, source_type, request_fingerprint_sha256,
                 payload_sha256, payload_uri, captured_at, received_at,
+                source_available_at,
                 provider_response_status, payload_bytes,
                 provider_quota_remaining, schema_version, license_scope,
                 license_version, receipt_sha256, created_at
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 200, 0, %s, 'ci-v1', %s, %s, %s, %s
             )
             """,
@@ -339,6 +340,7 @@ class IngestionAdmissionRepositoryPostgresTests(unittest.TestCase):
                 uuid4().hex + uuid4().hex,
                 payload_sha256,
                 f"s3://ci-admission/raw/{provider}/sha256/{payload_sha256}",
+                received_at,
                 received_at,
                 received_at,
                 quota_remaining,
