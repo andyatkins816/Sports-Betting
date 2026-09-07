@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 
 PROVIDER_SHADOW_EVIDENCE_URI = "s3://sam-raw-evidence-staging/raw/the_odds_api"
+PROVIDER_PRODUCTION_EVIDENCE_URI = "s3://sam-raw-evidence-prod/raw/the_odds_api"
 PROVIDER_SHADOW_MAX_BYTES = 10 * 1024 * 1024
 PROVIDER_SHADOW_ALLOWED_SPORT_KEYS = frozenset(
     {"americanfootball_nfl", "baseball_mlb", "basketball_nba"}
@@ -26,6 +27,8 @@ PROVIDER_SHADOW_LICENSE_SCOPE = "internal_analytics_only"
 PROVIDER_SHADOW_LICENSE_VERSION = "terms-2026-08-31"
 
 _STAGING_ENVIRONMENT = "staging"
+_PRODUCTION_ENVIRONMENT = "production"
+_ADMITTED_ENVIRONMENTS = frozenset({_STAGING_ENVIRONMENT, _PRODUCTION_ENVIRONMENT})
 _PRIVATE_WORKER_ROLE = "private_ingestion"
 _PROVIDER_SHADOW_MODE = "provider_shadow"
 _ODDS_PROVIDER = "the_odds_api"
@@ -115,7 +118,7 @@ class ProviderShadowSettings:
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> ProviderShadowSettings:
-        """Validate the exact staging-only provider-shadow configuration."""
+        """Validate the exact staging or production provider configuration."""
 
         values = os.environ if environ is None else environ
         _reject_forbidden_settings(values)
@@ -123,7 +126,7 @@ class ProviderShadowSettings:
         _require_service_url(values, name="REDIS_URL")
         _require_secrets(values)
 
-        environment = _required_exact(values, "APP_ENV", _STAGING_ENVIRONMENT)
+        environment = _required_allowed(values, "APP_ENV", _ADMITTED_ENVIRONMENTS)
         role = _required_exact(values, "SAM_WORKER_ROLE", _PRIVATE_WORKER_ROLE)
         mode = _required_exact(values, "SAM_WORKER_MODE", _PROVIDER_SHADOW_MODE)
         _required_exact(values, "SAM_INGESTION_ENABLED", "true")
@@ -146,9 +149,12 @@ class ProviderShadowSettings:
             PROVIDER_SHADOW_LICENSE_VERSION,
         )
         backend = _required_exact(values, "SAM_RAW_EVIDENCE_STORE_BACKEND", _R2_BACKEND)
-        store_uri = _required_exact(
-            values, "SAM_RAW_EVIDENCE_STORE_URI", PROVIDER_SHADOW_EVIDENCE_URI
+        expected_store_uri = (
+            PROVIDER_PRODUCTION_EVIDENCE_URI
+            if environment == _PRODUCTION_ENVIRONMENT
+            else PROVIDER_SHADOW_EVIDENCE_URI
         )
+        store_uri = _required_exact(values, "SAM_RAW_EVIDENCE_STORE_URI", expected_store_uri)
         region = _required_exact(values, "SAM_RAW_EVIDENCE_S3_REGION", _R2_REGION)
         endpoint_url = _required_text(values, "SAM_RAW_EVIDENCE_S3_ENDPOINT_URL")
         _validate_r2_endpoint(endpoint_url)
