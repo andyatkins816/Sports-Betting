@@ -266,6 +266,23 @@ class MigrationRunnerTests(unittest.TestCase):
         )
         self.assertIn("PERFORM public.lock_model_governance(NEW.id)", migration.sql)
 
+    def test_checked_in_historical_availability_migration_preserves_receipt_time(self):
+        migrations_dir = Path(__file__).resolve().parents[1] / "migrations"
+        migration = next(
+            item
+            for item in discover_migrations(migrations_dir)
+            if item.filename == "011_historical_evidence_availability.sql"
+        )
+
+        self.assertIn("ADD COLUMN source_available_at TIMESTAMPTZ", migration.sql)
+        self.assertEqual(migration.sql.count("SET source_available_at = received_at"), 3)
+        self.assertNotIn("source_available_at SET DEFAULT", migration.sql)
+        self.assertIn("provider_payload_receipt_source_availability_valid", migration.sql)
+        self.assertIn("odds_snapshot_source_availability_valid", migration.sql)
+        self.assertIn("event_result_source_availability_valid", migration.sql)
+        self.assertIn("receipt_source_available_at <> NEW.source_available_at", migration.sql)
+        self.assertIn("source_available_at <= received_at", migration.sql)
+
     def _connection_for_url(self, supplied_url, expected_url, connection):
         self.assertEqual(supplied_url, expected_url)
         return connection

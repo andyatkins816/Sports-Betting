@@ -94,6 +94,7 @@ class PreparedOddsPayload:
     requests_used: int | None = None
     request_cost: int | None = None
     content_type: str = "application/json"
+    source_available_at: datetime | None = None
 
     @property
     def request_fingerprint_sha256(self) -> str:
@@ -125,6 +126,7 @@ class PreparedResultsPayload:
     requests_used: int | None = None
     request_cost: int | None = None
     content_type: str = "application/json"
+    source_available_at: datetime | None = None
 
     @property
     def request_fingerprint_sha256(self) -> str:
@@ -236,7 +238,9 @@ class OddsLedger:
         _validate_prepared_payload(payload, now=validation_time)
         provider_use = self._authorize(payload)
         try:
-            normalized_quotes = tuple(normalize_quotes(payload.quotes, now=validation_time))
+            normalized_quotes = tuple(
+                normalize_quotes(payload.quotes, now=_payload_source_available_at(payload))
+            )
         except ValueError:
             raise OddsLedgerValidationError("provider quotes failed pregame validation") from None
         event_identities = _event_identities(normalized_quotes)
@@ -406,6 +410,7 @@ class OddsLedger:
                         provenance_id=provenance_id,
                         payload_sha256=stored_payload.payload_sha256,
                         received_at=payload.received_at,
+                        source_available_at=_payload_source_available_at(payload),
                     )
                     status = "accepted" if normalized_quotes else "accepted_empty"
                     _insert_provider_signal(
@@ -460,6 +465,10 @@ class OddsLedger:
                         cursor,
                         event_identities,
                         allow_schedule_drift=True,
+                        require_existing=any(
+                            _result_event_key(score) != (score.provider, score.event_id)
+                            for score in payload.scores
+                        ),
                     )
                     if conflicts:
                         for conflict in conflicts:
@@ -494,6 +503,7 @@ class OddsLedger:
                         provenance_id=provenance_id,
                         payload_sha256=stored_payload.payload_sha256,
                         received_at=payload.received_at,
+                        source_available_at=_payload_source_available_at(payload),
                     )
                     status = "accepted" if payload.scores else "accepted_empty"
                     _insert_provider_signal(
@@ -563,6 +573,9 @@ def prepare_the_odds_api_payload(
     regions = getattr(scope, "regions", None)
     markets = getattr(scope, "markets", None)
     bookmakers = getattr(scope, "bookmakers", ())
+    requested_snapshot_at = getattr(scope, "snapshot_at", None)
+    fetch_source_available_at = getattr(fetch, "source_available_at", None)
+    source_available_at = fetch_source_available_at or received_at
     if (
         not _nonempty_text(sport_key)
         or not isinstance(regions, tuple)
@@ -577,10 +590,22 @@ def prepare_the_odds_api_payload(
     ]
     if bookmakers:
         request_scope.append(("bookmakers", ",".join(bookmakers)))
+    if requested_snapshot_at is not None:
+        if fetch_source_available_at is None:
+            raise OddsLedgerValidationError(
+                "historical provider fetch does not contain source availability"
+            )
+        if not _aware(requested_snapshot_at) or not _aware(source_available_at):
+            raise OddsLedgerValidationError("historical provider timestamps are invalid")
+        if source_available_at > requested_snapshot_at:
+            raise OddsLedgerValidationError(
+                "historical provider availability is after the requested snapshot"
+            )
+        request_scope.append(("snapshot_at", _utc(requested_snapshot_at)))
     # A valid empty response is still provider evidence.  With no provider
-    # quote timestamp available, bind that receipt to the local receipt time
-    # and persist it as ``accepted_empty`` rather than silently discarding it.
-    captured_at = max((quote.captured_at for quote in quotes), default=received_at)
+    # quote timestamp available, bind it to the provider snapshot time (or the
+    # local receipt for live odds) and persist ``accepted_empty`` explicitly.
+    captured_at = max((quote.captured_at for quote in quotes), default=source_available_at)
     return PreparedOddsPayload(
         provider="the_odds_api",
         source_type=source_type,
@@ -596,6 +621,7 @@ def prepare_the_odds_api_payload(
         requests_remaining=getattr(fetch, "requests_remaining", None),
         requests_used=getattr(fetch, "requests_used", None),
         request_cost=getattr(fetch, "request_cost", None),
+        source_available_at=source_available_at,
     )
 
 
@@ -654,6 +680,7 @@ def prepare_the_odds_api_results_payload(
         requests_remaining=getattr(fetch, "requests_remaining", None),
         requests_used=getattr(fetch, "requests_used", None),
         request_cost=getattr(fetch, "request_cost", None),
+        source_available_at=received_at,
     )
 
 
@@ -695,10 +722,18 @@ def _validate_payload_envelope(
             raise OddsLedgerValidationError(f"prepared {kind} payload has a required empty field")
     if not isinstance(payload.raw_payload, bytes) or not payload.raw_payload:
         raise OddsLedgerValidationError("provider response must be non-empty bytes")
-    if not _aware(payload.captured_at) or not _aware(payload.received_at) or not _aware(now):
+    source_available_at = _payload_source_available_at(payload)
+    if (
+        not _aware(payload.captured_at)
+        or not _aware(payload.received_at)
+        or not _aware(source_available_at)
+        or not _aware(now)
+    ):
         raise OddsLedgerValidationError("provider and validation timestamps must be timezone-aware")
-    if payload.captured_at > payload.received_at + _MAX_PROVIDER_CLOCK_SKEW:
-        raise OddsLedgerValidationError("provider payload capture time is after local receipt")
+    if payload.captured_at > source_available_at + _MAX_PROVIDER_CLOCK_SKEW:
+        raise OddsLedgerValidationError("provider payload capture time is after source availability")
+    if source_available_at > payload.received_at + _MAX_PROVIDER_CLOCK_SKEW:
+        raise OddsLedgerValidationError("source availability is after local receipt")
     if payload.received_at > now:
         raise OddsLedgerValidationError("provider payload receipt time cannot be in the future")
     if not isinstance(payload.provider_response_status, int) or not 100 <= payload.provider_response_status <= 599:
@@ -715,8 +750,14 @@ def _validate_prepared_results_payload(
         raise OddsLedgerValidationError("prepared results payload is required")
     _validate_payload_envelope(payload, now=now, kind="results")
     scores = _validated_completed_scores(payload.scores, provider=payload.provider)
-    if any(score.last_update > payload.received_at + _MAX_PROVIDER_CLOCK_SKEW for score in scores):
-        raise OddsLedgerValidationError("provider result update is after local receipt")
+    for score in scores:
+        source_available_at = _score_source_available_at(score, payload)
+        if not _aware(source_available_at):
+            raise OddsLedgerValidationError("provider result availability must be timezone-aware")
+        if score.last_update > source_available_at + _MAX_PROVIDER_CLOCK_SKEW:
+            raise OddsLedgerValidationError("provider result update is after source availability")
+        if source_available_at > payload.received_at + _MAX_PROVIDER_CLOCK_SKEW:
+            raise OddsLedgerValidationError("provider result availability is after local receipt")
     _validated_request_scope(payload.request_scope)
 
 
@@ -730,12 +771,31 @@ def _validated_completed_scores(
     ):
         raise OddsLedgerValidationError("a provider payload must contain valid completed scores")
     provider_events: set[tuple[str, str]] = set()
+    matched_events: set[tuple[str, str]] = set()
     for score in scores:
         for field in ("provider", "event_id", "sport", "league", "home_team", "away_team"):
             if not _nonempty_text(getattr(score, field)):
                 raise OddsLedgerValidationError("completed score is missing event metadata")
         if score.provider != provider:
             raise OddsLedgerValidationError("completed score provider does not match its payload")
+        matched_provider = score.matched_event_provider
+        matched_event_id = score.matched_provider_event_id
+        if (matched_provider is None) != (matched_event_id is None):
+            raise OddsLedgerValidationError("completed score event mapping must be complete")
+        if matched_provider is not None and (
+            not _nonempty_text(matched_provider) or not _nonempty_text(matched_event_id)
+        ):
+            raise OddsLedgerValidationError("completed score event mapping is invalid")
+        if score.source_available_at is not None and not _aware(score.source_available_at):
+            raise OddsLedgerValidationError("completed score source availability must be timezone-aware")
+        if (
+            matched_provider is not None
+            and matched_provider != score.provider
+            and score.source_available_at != score.last_update
+        ):
+            raise OddsLedgerValidationError(
+                "cross-provider result availability must match its immutable update time"
+            )
         if score.home_team == score.away_team:
             raise OddsLedgerValidationError("completed score teams must be distinct")
         if not _aware(score.commence_time) or not _aware(score.last_update):
@@ -749,6 +809,10 @@ def _validated_completed_scores(
         if event_key in provider_events:
             raise OddsLedgerValidationError("provider payload contains duplicate completed events")
         provider_events.add(event_key)
+        matched_event_key = _result_event_key(score)
+        if matched_event_key in matched_events:
+            raise OddsLedgerValidationError("provider payload maps multiple results to one event")
+        matched_events.add(matched_event_key)
     return scores
 
 
@@ -802,8 +866,8 @@ def _event_identities(quotes: tuple[NormalizedQuote, ...]) -> tuple[_EventIdenti
 def _result_event_identities(scores: tuple[CompletedScore, ...]) -> tuple[_EventIdentity, ...]:
     return tuple(
         _EventIdentity(
-            provider=score.provider,
-            provider_event_id=score.event_id,
+            provider=_result_event_key(score)[0],
+            provider_event_id=_result_event_key(score)[1],
             sport=score.sport,
             league=score.league,
             starts_at=score.commence_time,
@@ -823,12 +887,14 @@ def _insert_or_select_receipt(
         """
         INSERT INTO provider_payload_receipt (
             provider, source_type, request_fingerprint_sha256, payload_sha256,
-            payload_uri, captured_at, received_at, provider_response_status,
+            payload_uri, captured_at, received_at, source_available_at,
+            provider_response_status,
             payload_bytes, provider_quota_remaining, provider_quota_used,
             provider_quota_last, schema_version, license_scope, license_version,
             receipt_sha256
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s
         ) ON CONFLICT (receipt_sha256) DO NOTHING
         RETURNING id
         """,
@@ -840,6 +906,7 @@ def _insert_or_select_receipt(
             stored_payload.payload_uri,
             payload.captured_at,
             payload.received_at,
+            _payload_source_available_at(payload),
             payload.provider_response_status,
             stored_payload.byte_count,
             payload.requests_remaining,
@@ -903,34 +970,36 @@ def _ensure_event_identities(
     identities: tuple[_EventIdentity, ...],
     *,
     allow_schedule_drift: bool = False,
+    require_existing: bool = False,
 ) -> tuple[dict[tuple[str, str], Any], int, tuple[_EventIdentity, ...]]:
     event_ids: dict[tuple[str, str], Any] = {}
     conflicts: list[_EventIdentity] = []
     created = 0
     for identity in identities:
-        cursor.execute(
-            """
-            INSERT INTO sports_event (
-                provider, provider_event_id, sport, league, starts_at, home_team, away_team
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (provider, provider_event_id) DO NOTHING
-            RETURNING id
-            """,
-            (
-                identity.provider,
-                identity.provider_event_id,
-                identity.sport,
-                identity.league,
-                identity.starts_at,
-                identity.home_team,
-                identity.away_team,
-            ),
-        )
-        inserted = cursor.fetchone()
-        if inserted is not None:
-            event_ids[(identity.provider, identity.provider_event_id)] = inserted[0]
-            created += 1
-            continue
+        if not require_existing:
+            cursor.execute(
+                """
+                INSERT INTO sports_event (
+                    provider, provider_event_id, sport, league, starts_at, home_team, away_team
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (provider, provider_event_id) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    identity.provider,
+                    identity.provider_event_id,
+                    identity.sport,
+                    identity.league,
+                    identity.starts_at,
+                    identity.home_team,
+                    identity.away_team,
+                ),
+            )
+            inserted = cursor.fetchone()
+            if inserted is not None:
+                event_ids[(identity.provider, identity.provider_event_id)] = inserted[0]
+                created += 1
+                continue
         cursor.execute(
             """
             SELECT id, sport, league, starts_at, home_team, away_team
@@ -942,11 +1011,24 @@ def _ensure_event_identities(
         )
         existing = cursor.fetchone()
         if existing is None:
+            if require_existing:
+                raise OddsLedgerValidationError(
+                    "completed score references an unavailable matched event"
+                )
             raise OddsLedgerUnavailable("event identity could not be read after insert")
         event_ids[(identity.provider, identity.provider_event_id)] = existing[0]
         if allow_schedule_drift:
-            candidate_fields = (identity.sport, identity.home_team, identity.away_team)
-            existing_fields = (existing[1], existing[4], existing[5])
+            if require_existing:
+                candidate_fields = (
+                    identity.sport,
+                    identity.starts_at,
+                    identity.home_team,
+                    identity.away_team,
+                )
+                existing_fields = (existing[1], existing[3], existing[4], existing[5])
+            else:
+                candidate_fields = (identity.sport, identity.home_team, identity.away_team)
+                existing_fields = (existing[1], existing[4], existing[5])
         else:
             candidate_fields = (
                 identity.sport,
@@ -992,6 +1074,7 @@ def _insert_odds_snapshots(
     provenance_id: Any,
     payload_sha256: str,
     received_at: datetime,
+    source_available_at: datetime,
 ) -> tuple[int, int, int]:
     created = 0
     replayed = 0
@@ -1004,9 +1087,10 @@ def _insert_odds_snapshots(
             INSERT INTO odds_snapshot (
                 event_id, provider, provider_quote_id, bookmaker, market, selection,
                 line, american_odds, decimal_odds, captured_at, received_at,
-                source_payload_sha256, idempotency_key, primary_provenance_id
+                source_available_at, source_payload_sha256, idempotency_key,
+                primary_provenance_id
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             ) ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING id
             """,
@@ -1022,6 +1106,7 @@ def _insert_odds_snapshots(
                 quote.decimal_odds,
                 raw.captured_at,
                 received_at,
+                source_available_at,
                 payload_sha256,
                 quote.idempotency_key,
                 provenance_id,
@@ -1058,19 +1143,21 @@ def _insert_event_results(
     provenance_id: Any,
     payload_sha256: str,
     received_at: datetime,
+    source_available_at: datetime,
 ) -> tuple[int, int, int]:
     created = 0
     replayed = 0
     provenance_links_created = 0
     for score in scores:
-        event_id = event_ids[(score.provider, score.event_id)]
+        event_id = event_ids[_result_event_key(score)]
         provider_result_id = _provider_result_id(score)
+        score_available_at = score.source_available_at or source_available_at
         cursor.execute(
             """
             INSERT INTO event_result (
                 event_id, provider, provider_result_id, settled_at, home_score,
-                away_score, source_payload_sha256, received_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                away_score, source_payload_sha256, received_at, source_available_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (provider, provider_result_id) DO NOTHING
             RETURNING id
             """,
@@ -1083,6 +1170,7 @@ def _insert_event_results(
                 score.away_score,
                 payload_sha256,
                 received_at,
+                score_available_at,
             ),
         )
         result = cursor.fetchone()
@@ -1112,14 +1200,33 @@ def _insert_event_results(
 
 
 def _provider_result_id(score: CompletedScore) -> str:
-    return _canonical_sha256(
-        {
-            "provider_event_id": score.event_id,
-            "last_update": _utc(score.last_update),
-            "home_score": score.home_score,
-            "away_score": score.away_score,
-        }
-    )
+    identity = {
+        "provider_event_id": score.event_id,
+        "last_update": _utc(score.last_update),
+        "home_score": score.home_score,
+        "away_score": score.away_score,
+    }
+    # Preserve the established ID for ordinary same-provider results.  The
+    # extra identity fields are needed only for historical/cross-provider
+    # evidence; hashing explicit nulls here would replay every existing live
+    # result as a new immutable version after this release.
+    if (
+        score.matched_event_provider is not None
+        or score.matched_provider_event_id is not None
+        or score.source_available_at is not None
+    ):
+        identity.update(
+            {
+                "matched_event_provider": score.matched_event_provider,
+                "matched_provider_event_id": score.matched_provider_event_id,
+                "source_available_at": (
+                    _utc(score.source_available_at)
+                    if score.source_available_at is not None
+                    else None
+                ),
+            }
+        )
+    return _canonical_sha256(identity)
 
 
 def _insert_provider_signal(
@@ -1180,6 +1287,7 @@ def _payload_receipt_sha256(payload: PreparedOddsPayload | PreparedResultsPayloa
             "payload_sha256": hashlib.sha256(payload.raw_payload).hexdigest(),
             "captured_at": _utc(payload.captured_at),
             "received_at": _utc(payload.received_at),
+            "source_available_at": _utc(_payload_source_available_at(payload)),
             "provider_response_status": payload.provider_response_status,
             "payload_bytes": len(payload.raw_payload),
             "requests_remaining": payload.requests_remaining,
@@ -1189,6 +1297,23 @@ def _payload_receipt_sha256(payload: PreparedOddsPayload | PreparedResultsPayloa
             "license_scope": payload.license_scope,
             "license_version": payload.license_version,
         }
+    )
+
+
+def _payload_source_available_at(
+    payload: PreparedOddsPayload | PreparedResultsPayload,
+) -> datetime:
+    return payload.source_available_at or payload.received_at
+
+
+def _score_source_available_at(score: CompletedScore, payload: PreparedResultsPayload) -> datetime:
+    return score.source_available_at or _payload_source_available_at(payload)
+
+
+def _result_event_key(score: CompletedScore) -> tuple[str, str]:
+    return (
+        score.matched_event_provider or score.provider,
+        score.matched_provider_event_id or score.event_id,
     )
 
 

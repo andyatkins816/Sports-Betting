@@ -250,13 +250,14 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
             INSERT INTO provider_payload_receipt (
                 provider, source_type, request_fingerprint_sha256,
                 payload_sha256, payload_uri, captured_at, received_at,
+                source_available_at,
                 provider_response_status, payload_bytes,
                 provider_quota_remaining, provider_quota_used,
                 provider_quota_last, schema_version, license_scope,
                 license_version, receipt_sha256, created_at
             ) VALUES (
                 'sam_synthetic', 'storage_probe', %s, %s, %s,
-                %s, %s, 200, 0, 10000, 0, 1, 'ci-v1',
+                %s, %s, %s, 200, 0, 10000, 0, 1, 'ci-v1',
                 'synthetic_test_only', 'ci-v1', %s, %s
             )
             ON CONFLICT (receipt_sha256) DO NOTHING
@@ -265,6 +266,7 @@ class IngestionControlPlanePostgresTests(unittest.TestCase):
                 request_sha256,
                 payload_sha256,
                 f"s3://ci-ingestion-admission/raw/synthetic/sha256/{payload_sha256}",
+                observed_at,
                 observed_at,
                 observed_at,
                 receipt_sha256,

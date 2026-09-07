@@ -338,6 +338,9 @@ output, complete signed data licenses, a data inventory, privacy/terms,
 age/jurisdiction rules, responsible-gambling disclosures, model approvals,
 monitoring, and jurisdiction-specific legal review. Do not enable wager
 submission without the necessary regulatory and operator authorization.
+Before exposing any output derived from Retrosheet game logs, publish a visible
+Retrosheet credit and link to its notice at <https://www.retrosheet.org/notice.txt>
+in the Base44 public UI.
 
 ## Primary references
 
